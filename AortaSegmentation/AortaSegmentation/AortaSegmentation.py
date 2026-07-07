@@ -15,12 +15,12 @@ from slicer.parameterNodeWrapper import parameterNodeWrapper
 from slicer import vtkMRMLScalarVolumeNode
 from slicer import vtkMRMLSegmentationNode
 
-# TODO: after training, zip the model's config folder (the one directly containing
-# dataset.json, plans.json, fold_0/, fold_1/, ...) and upload it as a GitHub Release
-# asset. Fill in the direct download URL and the sha256 of the zip below
-# (compute with: shasum -a 256 model.zip).
-MODEL_DOWNLOAD_URL = "https://github.com/<org>/<repo>/releases/download/<tag>/aorta_nnunet_model.zip"
-MODEL_SHA256 = "<TODO-fill-in-after-uploading-the-model-zip>"
+# Trained nnU-Net v2 (3d_fullres, 5 folds), single-channel MRI, foreground="aorta".
+# Package contains only dataset.json/plans.json/dataset_fingerprint.json plus
+# fold_0..fold_4/checkpoint_final.pth (validation dumps and checkpoint_best.pth are
+# stripped out to keep the download small). Mean validation Dice (fold 0): 0.90.
+MODEL_DOWNLOAD_URL = "https://github.com/esranko1/AortaSegmentationSlicer/releases/download/model-v1/aorta_nnunet_model.zip"
+MODEL_SHA256 = "1337ef986d706da71cf2b1c4eb4aba924bfd1f6780fbb8529c08d79183dda3fd"
 
 
 #
