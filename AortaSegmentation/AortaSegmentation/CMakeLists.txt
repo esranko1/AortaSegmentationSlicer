@@ -9,6 +9,8 @@ set(MODULE_PYTHON_SCRIPTS
 set(MODULE_PYTHON_RESOURCES
   Resources/Icons/${MODULE_NAME}.png
   Resources/UI/${MODULE_NAME}.ui
+  Resources/nnUNetCustomCode/nnUNetTrainerAorta.py
+  Resources/nnUNetCustomCode/topology_losses.py
   )
 
 #-----------------------------------------------------------------------------

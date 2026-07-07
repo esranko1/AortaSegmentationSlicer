@@ -195,6 +195,23 @@ class AortaSegmentationLogic(ScriptedLoadableModuleLogic):
             import nnunetv2  # noqa: F401
         return torch
 
+    def _ensureCustomTrainer(self) -> None:
+        """Copies the custom nnUNetTrainerAorta trainer (and its topology-loss dependency)
+        into the installed nnunetv2 package. The model was trained with this custom trainer
+        (adds clDice topology loss + patient-grouped cross-validation splits); nnUNetPredictor
+        looks trainers up by class name inside nnunetv2's own package tree, so a plain
+        `pip install nnunetv2` does not include it."""
+        import nnunetv2
+
+        nnunetv2Dir = Path(nnunetv2.__file__).parent
+        bundledDir = Path(__file__).parent / "Resources" / "nnUNetCustomCode"
+
+        shutil.copy2(bundledDir / "topology_losses.py", nnunetv2Dir / "training" / "loss" / "topology_losses.py")
+        shutil.copy2(
+            bundledDir / "nnUNetTrainerAorta.py",
+            nnunetv2Dir / "training" / "nnUNetTrainer" / "nnUNetTrainerAorta.py",
+        )
+
     def _ensureModel(self) -> Path:
         """Downloads and caches the trained nnU-Net model folder, returns its path."""
         modelDir = Path(slicer.app.cachePath) / "AortaSegmentation" / "model"
@@ -231,6 +248,7 @@ class AortaSegmentationLogic(ScriptedLoadableModuleLogic):
         startTime = time.time()
         status(_("Checking dependencies..."))
         torch = self._ensureDependencies()
+        self._ensureCustomTrainer()
 
         status(_("Checking model weights..."))
         modelFolder = self._ensureModel()
