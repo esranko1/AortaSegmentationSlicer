@@ -72,15 +72,19 @@ def main() -> int:
     predictor.initialize_from_trained_model_folder(str(modelFolder), use_folds=useFolds, checkpoint_name=checkpointName)
 
     print("Running segmentation...", flush=True)
-    # num_processes=1: nnU-Net's multiprocessing preprocessing/export workers are only
-    # worth the overhead when segmenting many cases at once; we only ever segment one.
-    predictor.predict_from_files(
+    # predict_from_files_sequential (not predict_from_files): nnU-Net's regular
+    # predict_from_files always spawns worker processes via
+    # multiprocessing.get_context("spawn").Pool(...), even when num_processes=1. Inside
+    # Slicer's embedded Python on Windows, sys.executable resolves to Slicer itself, so
+    # a spawned "worker" actually relaunches the full Slicer application, which then
+    # crashes trying to boot as a module host. predict_from_files_sequential runs
+    # entirely in this process instead - no multiprocessing, no spawn. Since this script
+    # only ever segments one volume at a time, there's no parallelism to lose anyway.
+    predictor.predict_from_files_sequential(
         str(args.input_dir),
         str(args.output_dir),
         save_probabilities=False,
         overwrite=True,
-        num_processes_preprocessing=1,
-        num_processes_segmentation_export=1,
     )
     print("Done.", flush=True)
     return 0
