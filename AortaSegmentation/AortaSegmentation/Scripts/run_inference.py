@@ -61,7 +61,10 @@ def main() -> int:
     print(f"Using device: {device}", flush=True)
 
     predictor = nnUNetPredictor(
-        tile_step_size=0.5,
+        # 0.8 vs the nnU-Net default of 0.5: fewer overlapping sliding-window tiles.
+        # TotalSegmentator's own benchmarking found this near-free (~0.001 Dice) while
+        # cutting meaningful CPU runtime (see wasserth/TotalSegmentator nnunet.py).
+        tile_step_size=0.8,
         use_gaussian=True,
         use_mirroring=True,
         perform_everything_on_device=True,
