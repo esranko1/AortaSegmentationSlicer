@@ -11,6 +11,7 @@ set(MODULE_PYTHON_RESOURCES
   Resources/UI/${MODULE_NAME}.ui
   Resources/nnUNetCustomCode/nnUNetTrainerAorta.py
   Resources/nnUNetCustomCode/topology_losses.py
+  Scripts/run_inference.py
   )
 
 #-----------------------------------------------------------------------------

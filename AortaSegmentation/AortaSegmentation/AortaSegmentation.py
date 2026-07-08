@@ -193,24 +193,6 @@ class AortaSegmentationLogic(ScriptedLoadableModuleLogic):
             slicer.util.pip_install("nnunetv2")
             import torch
             import nnunetv2  # noqa: F401
-        return torch
-
-    def _ensureCustomTrainer(self) -> None:
-        """Copies the custom nnUNetTrainerAorta trainer (and its topology-loss dependency)
-        into the installed nnunetv2 package. The model was trained with this custom trainer
-        (adds clDice topology loss + patient-grouped cross-validation splits); nnUNetPredictor
-        looks trainers up by class name inside nnunetv2's own package tree, so a plain
-        `pip install nnunetv2` does not include it."""
-        import nnunetv2
-
-        nnunetv2Dir = Path(nnunetv2.__file__).parent
-        bundledDir = Path(__file__).parent / "Resources" / "nnUNetCustomCode"
-
-        shutil.copy2(bundledDir / "topology_losses.py", nnunetv2Dir / "training" / "loss" / "topology_losses.py")
-        shutil.copy2(
-            bundledDir / "nnUNetTrainerAorta.py",
-            nnunetv2Dir / "training" / "nnUNetTrainer" / "nnUNetTrainerAorta.py",
-        )
 
     def _ensureModel(self) -> Path:
         """Downloads and caches the trained nnU-Net model folder, returns its path."""
@@ -223,6 +205,35 @@ class AortaSegmentationLogic(ScriptedLoadableModuleLogic):
             slicer.util.extractArchive(str(zipPath), str(modelDir))
             zipPath.unlink()
         return modelDir
+
+    def _runInferenceSubprocess(self, inputDir: Path, outputDir: Path, modelFolder: Path, status) -> None:
+        """Runs Scripts/run_inference.py as a separate process (via Slicer's own Python)
+        instead of calling nnU-Net in-process. Streaming its stdout back line-by-line -
+        each line passed to status(), which pumps Qt's event loop - is what keeps Slicer
+        responsive during the multi-minute run instead of appearing to hang; the same
+        pattern SlicerTotalSegmentator uses."""
+        pythonSlicerExecutablePath = shutil.which("PythonSlicer")
+        if not pythonSlicerExecutablePath:
+            raise RuntimeError(_("PythonSlicer executable not found"))
+
+        scriptPath = Path(__file__).parent / "Scripts" / "run_inference.py"
+        cmd = [
+            pythonSlicerExecutablePath,
+            str(scriptPath),
+            "--input-dir", str(inputDir),
+            "--output-dir", str(outputDir),
+            "--model", str(modelFolder),
+        ]
+
+        proc = slicer.util.launchConsoleProcess(cmd)
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            status(line.rstrip())
+        proc.wait()
+        if proc.returncode != 0:
+            raise RuntimeError(_("Inference subprocess failed with exit code {code}").format(code=proc.returncode))
 
     def process(
         self,
@@ -247,13 +258,10 @@ class AortaSegmentationLogic(ScriptedLoadableModuleLogic):
 
         startTime = time.time()
         status(_("Checking dependencies..."))
-        torch = self._ensureDependencies()
-        self._ensureCustomTrainer()
+        self._ensureDependencies()
 
         status(_("Checking model weights..."))
         modelFolder = self._ensureModel()
-
-        from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 
         tempDir = Path(slicer.util.tempDirectory())
         inputDir = tempDir / "input"
@@ -268,41 +276,8 @@ class AortaSegmentationLogic(ScriptedLoadableModuleLogic):
             # voxel array directly would silently flip the volume vs. what nnU-Net expects.
             slicer.util.saveNode(inputVolume, str(inputFile))
 
-            foldDirs = sorted(p.name for p in modelFolder.iterdir() if p.is_dir() and p.name.startswith("fold_"))
-            useFolds = tuple(int(name.split("_")[1]) for name in foldDirs) if foldDirs else (0,)
-            checkpointName = (
-                "checkpoint_final.pth"
-                if (modelFolder / foldDirs[0] / "checkpoint_final.pth").exists()
-                else "checkpoint_best.pth"
-            )
-
-            device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-            predictor = nnUNetPredictor(
-                tile_step_size=0.5,
-                use_gaussian=True,
-                use_mirroring=True,
-                perform_everything_on_device=True,
-                device=device,
-                verbose=False,
-                verbose_preprocessing=False,
-            )
-            predictor.initialize_from_trained_model_folder(
-                str(modelFolder), use_folds=useFolds, checkpoint_name=checkpointName
-            )
-
-            status(_("Running aorta segmentation (this can take a few minutes on CPU)..."))
-            # num_processes=1: nnU-Net's multiprocessing preprocessing/export workers don't
-            # play well with Slicer's embedded interpreter (esp. on Windows, where the
-            # "spawn" start method re-imports the launching module). Fine to serialize since
-            # this module only ever segments one volume at a time.
-            predictor.predict_from_files(
-                str(inputDir),
-                str(outputDir),
-                save_probabilities=False,
-                overwrite=True,
-                num_processes_preprocessing=1,
-                num_processes_segmentation_export=1,
-            )
+            status(_("Running aorta segmentation (this can take a few minutes)..."))
+            self._runInferenceSubprocess(inputDir, outputDir, modelFolder, status)
 
             status(_("Loading result..."))
             outputFile = outputDir / f"{caseId}.nii.gz"
