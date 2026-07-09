@@ -189,10 +189,21 @@ class AortaSegmentationLogic(ScriptedLoadableModuleLogic):
                 _("Install dependencies"),
             ):
                 raise RuntimeError(_("Dependency installation was cancelled by the user."))
-            slicer.util.pip_install("torch")
+            self._installTorch()
             slicer.util.pip_install("nnunetv2")
             import torch
             import nnunetv2  # noqa: F401
+
+    def _installTorch(self) -> None:
+        """Installs PyTorch, requesting a CUDA build if an NVIDIA GPU is present.
+        A plain `pip install torch` can silently resolve a CPU-only wheel even on a
+        machine with a capable GPU (observed on a machine with an RTX 3090): inference
+        then runs correctly but far slower, with no obvious indication why. Checking for
+        `nvidia-smi` and requesting the matching CUDA wheel avoids that trap."""
+        if shutil.which("nvidia-smi") is not None:
+            slicer.util.pip_install("torch --index-url https://download.pytorch.org/whl/cu121")
+        else:
+            slicer.util.pip_install("torch")
 
     def _ensureModel(self) -> Path:
         """Downloads and caches the trained nnU-Net model folder, returns its path."""
