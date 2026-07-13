@@ -1,8 +1,10 @@
+import json
 import logging
 import shutil
 from pathlib import Path
 from typing import Optional
 
+import qt
 import vtk
 
 import slicer
@@ -96,6 +98,19 @@ class AortaSegmentationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin)
 
         self.ui.applyButton.connect("clicked(bool)", self.onApplyButton)
 
+        self.ui.computeMetricsButton.connect("clicked(bool)", self.onComputeMetricsButton)
+        self.ui.outputSelector.connect("currentNodeChanged(vtkMRMLNode*)", self._checkCanComputeMetrics)
+        self.ui.metricsPythonPathLineEdit.connect("currentPathChanged(QString)", self._onMetricsPythonPathChanged)
+
+        settings = slicer.app.settings()
+        savedPythonPath = settings.value("AortaSegmentation/metricsPythonPath", "")
+        if not savedPythonPath:
+            # Best-effort default guess for a conda env named "metrics" with vmtk
+            # installed; edit/browse to point at your own VMTK-enabled environment.
+            savedPythonPath = str(Path.home() / "AppData" / "Local" / "miniconda3" / "envs" / "metrics" / "python.exe")
+        self.ui.metricsPythonPathLineEdit.currentPath = savedPythonPath
+        self._checkCanComputeMetrics()
+
         self.initializeParameterNode()
 
     def cleanup(self) -> None:
@@ -155,6 +170,44 @@ class AortaSegmentationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin)
                 statusCallback=self._setStatus,
             )
         self._setStatus("")
+
+    def _checkCanComputeMetrics(self, caller=None, event=None) -> None:
+        hasSegmentation = self.ui.outputSelector.currentNode() is not None
+        hasPythonPath = bool(self.ui.metricsPythonPathLineEdit.currentPath)
+        self.ui.computeMetricsButton.enabled = hasSegmentation and hasPythonPath
+
+    def _onMetricsPythonPathChanged(self, path: str) -> None:
+        slicer.app.settings().setValue("AortaSegmentation/metricsPythonPath", path)
+        self._checkCanComputeMetrics()
+
+    def onComputeMetricsButton(self) -> None:
+        with slicer.util.tryWithErrorDisplay(_("Failed to compute metrics."), waitCursor=True):
+            results = self.logic.computeMetrics(
+                self.ui.outputSelector.currentNode(),
+                self.ui.metricsPythonPathLineEdit.currentPath,
+                statusCallback=self._setStatus,
+            )
+            self._populateMetricsTable(results)
+        self._setStatus("")
+
+    def _populateMetricsTable(self, results: dict) -> None:
+        displayRows = [
+            ("DiameterMIS (mm)", results.get("diameter_mis_mm")),
+            ("Cross-sectional area (mm²)", results.get("cross_sectional_area_mm2")),
+            ("DiameterCE (mm)", results.get("diameter_ce_mm")),
+            ("Length (mm)", results.get("length_mm")),
+            ("Mean curvature", results.get("mean_curvature")),
+            ("Mean torsion", results.get("mean_torsion")),
+            ("Tortuosity", results.get("tortuosity")),
+            ("Surface area (mm²)", results.get("surface_area_mm2")),
+            ("Volume (mm³)", results.get("volume_mm3")),
+        ]
+        table = self.ui.metricsTableWidget
+        table.setRowCount(len(displayRows))
+        for row, (label, value) in enumerate(displayRows):
+            table.setItem(row, 0, qt.QTableWidgetItem(label))
+            valueText = "{:.4f}".format(value) if isinstance(value, float) else str(value)
+            table.setItem(row, 1, qt.QTableWidgetItem(valueText))
 
 
 #
@@ -309,6 +362,86 @@ class AortaSegmentationLogic(ScriptedLoadableModuleLogic):
         status(_("Done."))
         stopTime = time.time()
         logging.info(f"Processing completed in {stopTime - startTime:.2f} seconds")
+
+    def _runMetricsSubprocess(self, pythonExePath: str, segFile: Path, jsonPath: Path, outDir: Path, status) -> None:
+        """Runs Scripts/extracting_metrics.py via the given VMTK-enabled python.exe (not
+        PythonSlicer: vtkvmtk's compiled bindings must match a specific VTK build that
+        Slicer's own embedded Python can't provide, so this targets a separate conda/venv
+        environment the user points at). Streams stdout back the same way
+        _runInferenceSubprocess does, so a multi-minute run doesn't appear to hang Slicer."""
+        scriptPath = Path(__file__).parent / "Scripts" / "extracting_metrics.py"
+        cmd = [
+            pythonExePath,
+            str(scriptPath),
+            "--seg", str(segFile),
+            "--out-json", str(jsonPath),
+            "--out-dir", str(outDir),
+        ]
+
+        proc = slicer.util.launchConsoleProcess(cmd)
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            status(line.rstrip())
+        proc.wait()
+        if proc.returncode != 0:
+            raise RuntimeError(_("Metrics subprocess failed with exit code {code}").format(code=proc.returncode))
+
+    def computeMetrics(
+        self,
+        segmentationNode: vtkMRMLSegmentationNode,
+        pythonExePath: str,
+        statusCallback=None,
+    ) -> dict:
+        """
+        Exports segmentationNode to a temporary NIfTI labelmap, runs
+        Scripts/extracting_metrics.py against pythonExePath as a subprocess, and returns
+        the parsed metrics dict (DiameterMIS, CrossSectionalArea, DiameterCE, Length,
+        mean curvature/torsion, Tortuosity, SurfaceArea, Volume).
+        """
+        if not segmentationNode:
+            raise ValueError(_("No segmentation selected"))
+        if not pythonExePath or not Path(pythonExePath).exists():
+            raise ValueError(_("VMTK python.exe not found at: {path}").format(path=pythonExePath))
+
+        import time
+
+        def status(message: str) -> None:
+            logging.info(message)
+            if statusCallback:
+                statusCallback(message)
+
+        startTime = time.time()
+        tempDir = Path(slicer.util.tempDirectory())
+        try:
+            status(_("Exporting segmentation..."))
+            segFile = tempDir / "segmentation.nii.gz"
+            labelmapVolumeNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode")
+            try:
+                slicer.modules.segmentations.logic().ExportVisibleSegmentsToLabelmapNode(
+                    segmentationNode, labelmapVolumeNode
+                )
+                slicer.util.saveNode(labelmapVolumeNode, str(segFile))
+            finally:
+                slicer.mrmlScene.RemoveNode(labelmapVolumeNode)
+
+            jsonPath = tempDir / "metrics.json"
+            outDir = tempDir / "out"
+            outDir.mkdir()
+
+            status(_("Computing aorta morphology metrics (this can take a minute)..."))
+            self._runMetricsSubprocess(pythonExePath, segFile, jsonPath, outDir, status)
+
+            with open(jsonPath) as f:
+                results = json.load(f)
+        finally:
+            shutil.rmtree(tempDir, ignore_errors=True)
+
+        status(_("Done."))
+        stopTime = time.time()
+        logging.info(f"Metrics computed in {stopTime - startTime:.2f} seconds")
+        return results
 
 
 #
