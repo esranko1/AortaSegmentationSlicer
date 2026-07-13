@@ -119,7 +119,7 @@ def get_surface_mesh(image, qform):
     return transform_filter.GetOutput()
 
 
-def smooth_surface(surface_poly_data, iterations=20, pass_band=0.1):
+def smooth_surface(surface_poly_data, iterations=20, pass_band=0.05):
     """
     Windowed-sinc smoothing to remove marching-cubes staircase artifacts.
     Slicer's own segmentation-to-closed-surface conversion applies smoothing
