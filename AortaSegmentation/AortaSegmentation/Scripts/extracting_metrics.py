@@ -119,6 +119,31 @@ def get_surface_mesh(image, qform):
     return transform_filter.GetOutput()
 
 
+def smooth_surface(surface_poly_data, iterations=20, pass_band=0.1):
+    """
+    Windowed-sinc smoothing to remove marching-cubes staircase artifacts.
+    Slicer's own segmentation-to-closed-surface conversion applies smoothing
+    by default before the real VMTK extension ever sees a surface; raw
+    marching cubes here with no equivalent smoothing pass produces a visibly
+    jaggier mesh. Confirmed by comparing this pipeline's output against the
+    real VMTK Slicer extension on the same manually-segmented mask: without
+    this step, SurfaceArea reads too high and DiameterCE/CrossSectionalArea/
+    Curvature/Torsion/Tortuosity all read too far in the direction a jagged
+    (rather than smooth) vessel wall would push them.
+    """
+    vtk, _ = _require_vtk()
+    smoother = vtk.vtkWindowedSincPolyDataFilter()
+    smoother.SetInputData(surface_poly_data)
+    smoother.SetNumberOfIterations(iterations)
+    smoother.SetPassBand(pass_band)
+    smoother.BoundarySmoothingOff()
+    smoother.FeatureEdgeSmoothingOff()
+    smoother.NonManifoldSmoothingOn()
+    smoother.NormalizeCoordinatesOn()
+    smoother.Update()
+    return smoother.GetOutput()
+
+
 # ---------------------------------------------------------------------------
 # Volume / surface area / DiameterMIS
 # ---------------------------------------------------------------------------
@@ -543,6 +568,7 @@ def main():
     image, arr, spacing, qform = read_nifti(args.seg)
     image, arr = keep_largest_component(image, arr)
     surface = get_surface_mesh(image, qform)
+    surface = smooth_surface(surface)
 
     volume = get_volume(arr, spacing)
     surface_area = get_surface_area(surface)
