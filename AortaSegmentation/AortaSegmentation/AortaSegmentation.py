@@ -185,6 +185,7 @@ class AortaSegmentationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin)
             results = self.logic.computeMetrics(
                 self.ui.outputSelector.currentNode(),
                 self.ui.metricsPythonPathLineEdit.currentPath,
+                referenceVolumeNode=self.ui.inputSelector.currentNode(),
                 statusCallback=self._setStatus,
             )
             self._populateMetricsTable(results)
@@ -392,6 +393,7 @@ class AortaSegmentationLogic(ScriptedLoadableModuleLogic):
         self,
         segmentationNode: vtkMRMLSegmentationNode,
         pythonExePath: str,
+        referenceVolumeNode: vtkMRMLScalarVolumeNode = None,
         statusCallback=None,
     ) -> dict:
         """
@@ -399,6 +401,14 @@ class AortaSegmentationLogic(ScriptedLoadableModuleLogic):
         Scripts/extracting_metrics.py against pythonExePath as a subprocess, and returns
         the parsed metrics dict (DiameterMIS, CrossSectionalArea, DiameterCE, Length,
         mean curvature/torsion, Tortuosity, SurfaceArea, Volume).
+
+        referenceVolumeNode should be the volume the segmentation was created from (e.g.
+        the module's inputVolume). Without it, ExportVisibleSegmentsToLabelmapNode falls
+        back to the segmentation's own internal reference geometry, which can be
+        resampled/oversampled relative to the source scan (Slicer does this for smoother
+        segment editing) - confirmed to shift Volume by ~4% versus running the metrics
+        script directly against the original NIfTI. Passing the original volume forces
+        the export to align to the exact voxel grid the segmentation was made from.
         """
         if not segmentationNode:
             raise ValueError(_("No segmentation selected"))
@@ -420,7 +430,7 @@ class AortaSegmentationLogic(ScriptedLoadableModuleLogic):
             labelmapVolumeNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode")
             try:
                 slicer.modules.segmentations.logic().ExportVisibleSegmentsToLabelmapNode(
-                    segmentationNode, labelmapVolumeNode
+                    segmentationNode, labelmapVolumeNode, referenceVolumeNode
                 )
                 slicer.util.saveNode(labelmapVolumeNode, str(segFile))
             finally:

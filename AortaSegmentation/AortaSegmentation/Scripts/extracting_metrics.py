@@ -514,7 +514,7 @@ def get_centerline_metrics(centerline):
         'diameter_ce_mm':        2 * max_radius,
         'mean_curvature':        float(np.nanmean(curvature)),
         'max_curvature':         float(np.nanmax(curvature)),
-        'mean_torsion':          float(np.nanmean(np.abs(torsion))),
+        'mean_torsion':          float(np.nanmean(torsion)),
         'max_torsion':           float(np.nanmax(np.abs(torsion))),
     }
 
@@ -596,7 +596,7 @@ def main():
     print('DiameterCE:         {:.4f}'.format(cl_metrics['diameter_ce_mm']), flush=True)
     print('Length:             {:.4f}'.format(cl_metrics['length_mm']), flush=True)
     print('Curvature (mean):   {:.6f}'.format(cl_metrics['mean_curvature']), flush=True)
-    print('Torsion (mean|.|):  {:.6f}'.format(cl_metrics['mean_torsion']), flush=True)
+    print('Torsion (mean):     {:.6f}'.format(cl_metrics['mean_torsion']), flush=True)
     print('Tortuosity:         {:.5f}'.format(cl_metrics['tortuosity']), flush=True)
     print('SurfaceAreamm2:     {:.4f}'.format(surface_area), flush=True)
     print('Volumemm3:          {:.4f}'.format(volume), flush=True)
