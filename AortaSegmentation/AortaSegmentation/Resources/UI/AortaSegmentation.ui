@@ -119,43 +119,20 @@
       <string>Metrics</string>
      </property>
      <layout class="QFormLayout" name="formLayout_metrics">
-      <item row="0" column="0">
-       <widget class="QLabel" name="label_3">
-        <property name="text">
-         <string>VMTK python.exe:</string>
-        </property>
-       </widget>
-      </item>
-      <item row="0" column="1">
-       <widget class="ctkPathLineEdit" name="metricsPythonPathLineEdit">
-        <property name="toolTip">
-         <string>Path to python.exe of the conda/venv environment that has vmtk installed (Slicer's own Python cannot host VMTK).</string>
-        </property>
-        <property name="filters">
-         <set>ctkPathLineEdit::Files|ctkPathLineEdit::Executable</set>
-        </property>
-        <property name="nameFilters">
-         <stringlist>
-          <string>python.exe</string>
-          <string>python*</string>
-         </stringlist>
-        </property>
-       </widget>
-      </item>
-      <item row="1" column="0" colspan="2">
+      <item row="0" column="0" colspan="2">
        <widget class="QPushButton" name="computeMetricsButton">
         <property name="enabled">
          <bool>false</bool>
         </property>
         <property name="toolTip">
-         <string>Compute aorta morphology and centerline metrics for the selected segmentation.</string>
+         <string>Compute aorta morphology and centerline metrics for the selected segmentation. Uses the SlicerVMTK extension, installed automatically on first use if missing.</string>
         </property>
         <property name="text">
          <string>Compute Metrics</string>
         </property>
        </widget>
       </item>
-      <item row="2" column="0" colspan="2">
+      <item row="1" column="0" colspan="2">
        <widget class="QTableWidget" name="metricsTableWidget">
         <property name="editTriggers">
          <set>QAbstractItemView::NoEditTriggers</set>
@@ -220,11 +197,6 @@
    <extends>QWidget</extends>
    <header>ctkCollapsibleButton.h</header>
    <container>1</container>
-  </customwidget>
-  <customwidget>
-   <class>ctkPathLineEdit</class>
-   <extends>QWidget</extends>
-   <header>ctkPathLineEdit.h</header>
   </customwidget>
  </customwidgets>
  <resources/>

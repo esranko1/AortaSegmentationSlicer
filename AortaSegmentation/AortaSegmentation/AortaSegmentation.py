@@ -1,9 +1,10 @@
-import json
+import heapq
 import logging
 import shutil
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import qt
 import vtk
 
@@ -46,6 +47,12 @@ Segments the aorta from a single MRI volume using a pretrained nnU-Net model.
 Select an input volume and an output segmentation, then click Apply.
 On first use the module downloads its Python dependencies (PyTorch, nnU-Net) and
 the trained model weights, which requires an internet connection.
+
+The Metrics section computes aorta morphology and centerline measurements
+(diameter, cross-sectional area, length, curvature, torsion, tortuosity, surface
+area, volume) for a segmentation. On first use it installs the SlicerVMTK
+extension automatically (also requires internet access, and a one-time Slicer
+restart).
 """)
         self.parent.acknowledgementText = _("")
 
@@ -100,15 +107,6 @@ class AortaSegmentationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin)
 
         self.ui.computeMetricsButton.connect("clicked(bool)", self.onComputeMetricsButton)
         self.ui.outputSelector.connect("currentNodeChanged(vtkMRMLNode*)", self._checkCanComputeMetrics)
-        self.ui.metricsPythonPathLineEdit.connect("currentPathChanged(QString)", self._onMetricsPythonPathChanged)
-
-        settings = slicer.app.settings()
-        savedPythonPath = settings.value("AortaSegmentation/metricsPythonPath", "")
-        if not savedPythonPath:
-            # Best-effort default guess for a conda env named "metrics" with vmtk
-            # installed; edit/browse to point at your own VMTK-enabled environment.
-            savedPythonPath = str(Path.home() / "AppData" / "Local" / "miniconda3" / "envs" / "metrics" / "python.exe")
-        self.ui.metricsPythonPathLineEdit.currentPath = savedPythonPath
         self._checkCanComputeMetrics()
 
         self.initializeParameterNode()
@@ -172,19 +170,12 @@ class AortaSegmentationWidget(ScriptedLoadableModuleWidget, VTKObservationMixin)
         self._setStatus("")
 
     def _checkCanComputeMetrics(self, caller=None, event=None) -> None:
-        hasSegmentation = self.ui.outputSelector.currentNode() is not None
-        hasPythonPath = bool(self.ui.metricsPythonPathLineEdit.currentPath)
-        self.ui.computeMetricsButton.enabled = hasSegmentation and hasPythonPath
-
-    def _onMetricsPythonPathChanged(self, path: str) -> None:
-        slicer.app.settings().setValue("AortaSegmentation/metricsPythonPath", path)
-        self._checkCanComputeMetrics()
+        self.ui.computeMetricsButton.enabled = self.ui.outputSelector.currentNode() is not None
 
     def onComputeMetricsButton(self) -> None:
         with slicer.util.tryWithErrorDisplay(_("Failed to compute metrics."), waitCursor=True):
             results = self.logic.computeMetrics(
                 self.ui.outputSelector.currentNode(),
-                self.ui.metricsPythonPathLineEdit.currentPath,
                 referenceVolumeNode=self.ui.inputSelector.currentNode(),
                 statusCallback=self._setStatus,
             )
@@ -364,56 +355,274 @@ class AortaSegmentationLogic(ScriptedLoadableModuleLogic):
         stopTime = time.time()
         logging.info(f"Processing completed in {stopTime - startTime:.2f} seconds")
 
-    def _runMetricsSubprocess(self, pythonExePath: str, segFile: Path, jsonPath: Path, outDir: Path, status) -> None:
-        """Runs Scripts/extracting_metrics.py via the given VMTK-enabled python.exe (not
-        PythonSlicer: vtkvmtk's compiled bindings must match a specific VTK build that
-        Slicer's own embedded Python can't provide, so this targets a separate conda/venv
-        environment the user points at). Streams stdout back the same way
-        _runInferenceSubprocess does, so a multi-minute run doesn't appear to hang Slicer."""
-        scriptPath = Path(__file__).parent / "Scripts" / "extracting_metrics.py"
-        cmd = [
-            pythonExePath,
-            str(scriptPath),
-            "--seg", str(segFile),
-            "--out-json", str(jsonPath),
-            "--out-dir", str(outDir),
-        ]
+    def _ensureScipy(self) -> None:
+        """scipy isn't bundled with Slicer by default; needed for connected-component
+        labeling and the distance transform used by DiameterMIS."""
+        try:
+            import scipy  # noqa: F401
+        except ImportError:
+            slicer.util.pip_install("scipy")
 
-        proc = slicer.util.launchConsoleProcess(cmd)
-        while True:
-            line = proc.stdout.readline()
-            if not line:
-                break
-            status(line.rstrip())
-        proc.wait()
-        if proc.returncode != 0:
-            raise RuntimeError(_("Metrics subprocess failed with exit code {code}").format(code=proc.returncode))
+    def _ensureVmtkExtension(self) -> None:
+        """
+        Ensures the ExtractCenterline module (from the SlicerVMTK extension,
+        https://github.com/vmtk/SlicerExtension-VMTK) is installed, so its compiled
+        vtkvmtk libraries are importable in-process. This is not a pip package -
+        vtkvmtk's C++ bindings must be built against Slicer's own VTK, which is exactly
+        what SlicerVMTK's own build already does; we lean on that instead of maintaining
+        our own build or an external conda environment. Unlike a pip package, a
+        newly-installed Slicer extension isn't usable until Slicer restarts (extensions
+        are registered at application startup), so this may ask the user to restart and
+        click Compute Metrics again afterward.
+        """
+        if hasattr(slicer.modules, "extractcenterline"):
+            return
+
+        if not slicer.util.confirmOkCancelDisplay(
+            _(
+                "This feature requires the 'SlicerVMTK' extension (for centerline "
+                "extraction). It will be installed now, and Slicer will need to "
+                "restart afterward before Compute Metrics can be used."
+            ),
+            _("Install VMTK extension"),
+        ):
+            raise RuntimeError(_("VMTK extension installation was cancelled by the user."))
+
+        extensionsManagerModel = slicer.app.extensionsManagerModel()
+        extensionsManagerModel.updateExtensionsMetadataFromServer(True, True)
+        if not extensionsManagerModel.installExtension("SlicerVMTK"):
+            raise RuntimeError(
+                _(
+                    "Failed to install the SlicerVMTK extension automatically. Please "
+                    "install it manually from the Extension Manager (search for "
+                    "'SlicerVMTK') and restart Slicer."
+                )
+            )
+
+        slicer.util.infoDisplay(
+            _(
+                "The SlicerVMTK extension was installed. Slicer will now restart; "
+                "after it reopens, click Compute Metrics again."
+            )
+        )
+        slicer.app.restart()
+
+    def _keepLargestSurfaceComponent(self, polyData):
+        """Segmentations can contain small spurious disconnected surface fragments
+        (e.g. stray voxel islands in an automated prediction); every VMTK step
+        downstream assumes a single connected vessel surface, so isolate the largest
+        connected region before doing anything else."""
+        connectivity = vtk.vtkPolyDataConnectivityFilter()
+        connectivity.SetInputData(polyData)
+        connectivity.SetExtractionModeToLargestRegion()
+        connectivity.Update()
+        cleaner = vtk.vtkCleanPolyData()
+        cleaner.SetInputData(connectivity.GetOutput())
+        cleaner.Update()
+        return cleaner.GetOutput()
+
+    def _getNetworkEndPoints(self, network):
+        """Returns (point_id, coords) pairs for every degree-1 point in the network
+        graph (vessel-tree endpoints, including branch tips), largest-MIS-radius one
+        first (typically the aortic root, the widest opening)."""
+        points = network.GetPoints()
+        radiusArray = network.GetPointData().GetArray("Radius")
+
+        startPointId = -1
+        maxRadius = 0.0
+        endpointIds = vtk.vtkIdList()
+
+        for cellIndex in range(network.GetNumberOfCells()):
+            cell = network.GetCell(cellIndex)
+            nPts = cell.GetNumberOfPoints()
+            if nPts < 2:
+                continue
+            for pointIndex in (0, nPts - 1):
+                pointId = cell.GetPointId(pointIndex)
+                pointCells = vtk.vtkIdList()
+                network.GetPointCells(pointId, pointCells)
+                if pointCells.GetNumberOfIds() == 1:
+                    endpointIds.InsertUniqueId(pointId)
+                    radius = radiusArray.GetValue(pointId)
+                    if startPointId < 0 or radius > maxRadius:
+                        maxRadius = radius
+                        startPointId = pointId
+
+        endpoints = []
+        nEndpoints = endpointIds.GetNumberOfIds()
+        if nEndpoints == 0:
+            return endpoints
+        endpoints.append((startPointId, points.GetPoint(startPointId)))
+        for i in range(nEndpoints):
+            pointId = endpointIds.GetId(i)
+            if pointId == startPointId:
+                continue
+            endpoints.append((pointId, points.GetPoint(pointId)))
+        return endpoints
+
+    def _networkCellLength(self, network, cellIndex) -> float:
+        cell = network.GetCell(cellIndex)
+        nPts = cell.GetNumberOfPoints()
+        total = 0.0
+        prev = None
+        for i in range(nPts):
+            p = np.array(network.GetPoint(cell.GetPointId(i)))
+            if prev is not None:
+                total += float(np.linalg.norm(p - prev))
+            prev = p
+        return total
+
+    def _selectAortaEndPoints(self, network, endpoints):
+        """
+        Picks the true two aorta ends by cumulative PATH length along the vessel-tree
+        graph (Dijkstra), not straight-line distance. endpoints[0] is the
+        largest-MIS-radius endpoint (the aortic root, widest opening). The other true
+        aorta end is whichever endpoint requires the longest path to reach from the
+        root by walking the network's actual branch segments - not whichever is
+        geometrically farthest in 3D. Straight-line "farthest point" is unreliable
+        here: the aortic arch's U-turn can put a branch stub or a point on the arch
+        itself closer to the root in 3D space than the true (possibly short, if the
+        segmentation is cropped) distal end, silently shrinking the chord distance
+        used later and inflating Tortuosity (length / chord) well beyond the real
+        value. Dijkstra (not a naive "keep revisiting" walk) is used because the
+        network graph isn't guaranteed to be a perfect tree; a naive longest-path walk
+        can loop forever if it contains even one cycle.
+        """
+        rootId, rootCoords = endpoints[0]
+        if len(endpoints) == 2:
+            return rootCoords, endpoints[1][1]
+
+        adjacency = {}
+        for cellIndex in range(network.GetNumberOfCells()):
+            cell = network.GetCell(cellIndex)
+            nPts = cell.GetNumberOfPoints()
+            if nPts < 2:
+                continue
+            a = cell.GetPointId(0)
+            b = cell.GetPointId(nPts - 1)
+            length = self._networkCellLength(network, cellIndex)
+            adjacency.setdefault(a, []).append((b, length))
+            adjacency.setdefault(b, []).append((a, length))
+
+        distances = {rootId: 0.0}
+        visited = set()
+        heap = [(0.0, rootId)]
+        while heap:
+            dist, node = heapq.heappop(heap)
+            if node in visited:
+                continue
+            visited.add(node)
+            for neighbor, length in adjacency.get(node, []):
+                newDist = dist + length
+                if neighbor not in distances or newDist < distances[neighbor]:
+                    distances[neighbor] = newDist
+                    heapq.heappush(heap, (newDist, neighbor))
+
+        targetId, targetCoords = max(endpoints[1:], key=lambda e: distances.get(e[0], -1.0))
+        return rootCoords, targetCoords
+
+    def _centerlineMetrics(self, centerline) -> dict:
+        import vtk.util.numpy_support as vtk_np
+
+        def pointArray(name):
+            a = centerline.GetPointData().GetArray(name)
+            return vtk_np.vtk_to_numpy(a) if a is not None else None
+
+        def cellArray(name):
+            a = centerline.GetCellData().GetArray(name)
+            return vtk_np.vtk_to_numpy(a) if a is not None else None
+
+        curvatureAll = pointArray("Curvature")
+        torsionAll = pointArray("Torsion")
+        radiiAll = pointArray("MaximumInscribedSphereRadius")
+        length = cellArray("Length")
+        tortuosity = cellArray("Tortuosity")
+
+        nCells = centerline.GetNumberOfCells()
+        # vtkvmtkPolyDataCenterlines can emit more than one cell; the main aorta path
+        # is the longest one, not necessarily cell 0.
+        mainCell = int(np.argmax(length)) if nCells > 1 else 0
+
+        pointIds = centerline.GetCell(mainCell).GetPointIds()
+        mainPointIndices = [pointIds.GetId(i) for i in range(pointIds.GetNumberOfIds())]
+
+        curvature = curvatureAll[mainPointIndices]
+        torsion = torsionAll[mainPointIndices]
+        radii = radiiAll[mainPointIndices]
+
+        maxRadius = float(np.nanmax(radii))
+
+        return {
+            "length_mm": float(length[mainCell]),
+            # vmtk's raw Tortuosity array is (length/chord - 1); +1 gives the
+            # conventional length/chord ratio.
+            "tortuosity": float(tortuosity[mainCell]) + 1.0,
+            "max_cross_section_mm2": np.pi * maxRadius**2,
+            "diameter_ce_mm": 2 * maxRadius,
+            "mean_curvature": float(np.nanmean(curvature)),
+            # Signed mean (not mean of absolute value): torsion oscillates sign along
+            # a gently-curving vessel and should mostly cancel out, not accumulate.
+            "mean_torsion": float(np.nanmean(torsion)),
+        }
+
+    def _keepLargestArrayComponent(self, arr):
+        """Voxel-array equivalent of _keepLargestSurfaceComponent, for the Volume and
+        DiameterMIS calculations (which work from the labelmap directly, not the
+        surface)."""
+        from scipy.ndimage import label
+
+        labeled, numFeatures = label(arr > 0)
+        if numFeatures <= 1:
+            return arr
+        sizes = np.bincount(labeled.ravel())
+        sizes[0] = 0
+        largestLabel = sizes.argmax()
+        return (labeled == largestLabel).astype(np.float32)
+
+    def _getVolume(self, arr, spacing) -> float:
+        voxelVolumeMm3 = spacing[0] * spacing[1] * spacing[2]
+        return float(arr.sum()) * voxelVolumeMm3
+
+    def _getDiameterMis(self, arr, spacing) -> float:
+        from scipy.ndimage import distance_transform_edt
+
+        mask = arr.astype(bool)
+        # slicer.util.arrayFromVolume returns (k,j,i) = (z,y,x) index order;
+        # GetSpacing() returns (x,y,z), so the EDT sampling needs to be reversed to
+        # match the array's own axis order.
+        sampling = (spacing[2], spacing[1], spacing[0])
+        dist = distance_transform_edt(mask, sampling=sampling)
+        return float(dist.max()) * 2.0
+
+    def _getSurfaceArea(self, surface) -> float:
+        mass = vtk.vtkMassProperties()
+        mass.SetInputData(surface)
+        mass.Update()
+        return mass.GetSurfaceArea()
 
     def computeMetrics(
         self,
         segmentationNode: vtkMRMLSegmentationNode,
-        pythonExePath: str,
         referenceVolumeNode: vtkMRMLScalarVolumeNode = None,
         statusCallback=None,
     ) -> dict:
         """
-        Exports segmentationNode to a temporary NIfTI labelmap, runs
-        Scripts/extracting_metrics.py against pythonExePath as a subprocess, and returns
-        the parsed metrics dict (DiameterMIS, CrossSectionalArea, DiameterCE, Length,
-        mean curvature/torsion, Tortuosity, SurfaceArea, Volume).
+        Computes aorta morphology/centerline metrics (DiameterMIS, CrossSectionalArea,
+        DiameterCE, Length, mean curvature/torsion, Tortuosity, SurfaceArea, Volume)
+        for segmentationNode, entirely in-process using the SlicerVMTK extension's
+        ExtractCenterlineLogic (installed automatically on first use if missing - see
+        _ensureVmtkExtension).
 
-        referenceVolumeNode should be the volume the segmentation was created from (e.g.
-        the module's inputVolume). Without it, ExportVisibleSegmentsToLabelmapNode falls
-        back to the segmentation's own internal reference geometry, which can be
-        resampled/oversampled relative to the source scan (Slicer does this for smoother
-        segment editing) - confirmed to shift Volume by ~4% versus running the metrics
-        script directly against the original NIfTI. Passing the original volume forces
-        the export to align to the exact voxel grid the segmentation was made from.
+        referenceVolumeNode should be the volume the segmentation was created from
+        (e.g. the module's inputVolume). Without it, ExportVisibleSegmentsToLabelmapNode
+        falls back to the segmentation's own internal reference geometry, which can be
+        resampled/oversampled relative to the source scan (Slicer does this for
+        smoother segment editing) - confirmed to shift Volume by several percent versus
+        the original NIfTI. Passing the original volume forces the export to align to
+        the exact voxel grid the segmentation was made from.
         """
         if not segmentationNode:
             raise ValueError(_("No segmentation selected"))
-        if not pythonExePath or not Path(pythonExePath).exists():
-            raise ValueError(_("VMTK python.exe not found at: {path}").format(path=pythonExePath))
 
         import time
 
@@ -423,30 +632,95 @@ class AortaSegmentationLogic(ScriptedLoadableModuleLogic):
                 statusCallback(message)
 
         startTime = time.time()
-        tempDir = Path(slicer.util.tempDirectory())
+
+        status(_("Checking dependencies..."))
+        self._ensureScipy()
+        self._ensureVmtkExtension()
+
+        import ExtractCenterline
+        from vmtk import vtkvmtkComputationalGeometryPython as vtkvmtkComputationalGeometry
+
+        centerlineLogic = ExtractCenterline.ExtractCenterlineLogic()
+
+        status(_("Preparing surface..."))
+        segmentation = segmentationNode.GetSegmentation()
+        if segmentation.GetNumberOfSegments() == 0:
+            raise ValueError(_("Segmentation has no segments"))
+        segmentId = segmentation.GetNthSegmentID(0)
+        surfacePolyData = centerlineLogic.polyDataFromNode(segmentationNode, segmentId)
+        surfacePolyData = self._keepLargestSurfaceComponent(surfacePolyData)
+        preprocessedPolyData = centerlineLogic.preprocess(
+            surfacePolyData, targetNumberOfPoints=5000, decimationAggressiveness=4.0, subdivide=False
+        )
+
+        status(_("Finding vessel endpoints..."))
+        networkPolyData = centerlineLogic.extractNetwork(preprocessedPolyData, endPointsMarkupsNode=None)
+        networkCleaner = vtk.vtkCleanPolyData()
+        networkCleaner.SetInputData(networkPolyData)
+        networkCleaner.Update()
+        network = networkCleaner.GetOutput()
+        network.BuildCells()
+        network.BuildLinks(0)
+        endpoints = self._getNetworkEndPoints(network)
+        if len(endpoints) < 2:
+            raise RuntimeError(
+                _("Could not find two vessel endpoints (found {n}).").format(n=len(endpoints))
+            )
+        p0, p1 = self._selectAortaEndPoints(network, endpoints)
+
+        status(_("Computing centerline..."))
+        endPointsNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLMarkupsFiducialNode")
         try:
-            status(_("Exporting segmentation..."))
-            segFile = tempDir / "segmentation.nii.gz"
-            labelmapVolumeNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode")
-            try:
-                slicer.modules.segmentations.logic().ExportVisibleSegmentsToLabelmapNode(
-                    segmentationNode, labelmapVolumeNode, referenceVolumeNode
-                )
-                slicer.util.saveNode(labelmapVolumeNode, str(segFile))
-            finally:
-                slicer.mrmlScene.RemoveNode(labelmapVolumeNode)
-
-            jsonPath = tempDir / "metrics.json"
-            outDir = tempDir / "out"
-            outDir.mkdir()
-
-            status(_("Computing aorta morphology metrics (this can take a minute)..."))
-            self._runMetricsSubprocess(pythonExePath, segFile, jsonPath, outDir, status)
-
-            with open(jsonPath) as f:
-                results = json.load(f)
+            endPointsNode.AddControlPoint(vtk.vtkVector3d(p0[0], p0[1], p0[2]))
+            endPointsNode.AddControlPoint(vtk.vtkVector3d(p1[0], p1[1], p1[2]))
+            # The source/start point is the first UNselected control point; mark the
+            # target explicitly selected so p0 is unambiguously the source.
+            endPointsNode.SetNthControlPointSelected(0, False)
+            endPointsNode.SetNthControlPointSelected(1, True)
+            centerlinePolyData, _voronoi = centerlineLogic.extractCenterline(
+                preprocessedPolyData, endPointsNode, curveSamplingDistance=1.0
+            )
         finally:
-            shutil.rmtree(tempDir, ignore_errors=True)
+            slicer.mrmlScene.RemoveNode(endPointsNode)
+
+        status(_("Computing centerline geometry..."))
+        geometry = vtkvmtkComputationalGeometry.vtkvmtkCenterlineGeometry()
+        geometry.SetInputData(centerlinePolyData)
+        geometry.SetLengthArrayName("Length")
+        geometry.SetCurvatureArrayName("Curvature")
+        geometry.SetTorsionArrayName("Torsion")
+        geometry.SetTortuosityArrayName("Tortuosity")
+        geometry.SetLineSmoothing(0)
+        geometry.Update()
+        clMetrics = self._centerlineMetrics(geometry.GetOutput())
+
+        status(_("Computing volume metrics..."))
+        labelmapVolumeNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode")
+        try:
+            slicer.modules.segmentations.logic().ExportVisibleSegmentsToLabelmapNode(
+                segmentationNode, labelmapVolumeNode, referenceVolumeNode
+            )
+            arr = slicer.util.arrayFromVolume(labelmapVolumeNode)
+            spacing = labelmapVolumeNode.GetSpacing()
+            arr = self._keepLargestArrayComponent(arr)
+            volume = self._getVolume(arr, spacing)
+            diameterMis = self._getDiameterMis(arr, spacing)
+        finally:
+            slicer.mrmlScene.RemoveNode(labelmapVolumeNode)
+
+        surfaceArea = self._getSurfaceArea(surfacePolyData)
+
+        results = {
+            "diameter_mis_mm": diameterMis,
+            "cross_sectional_area_mm2": clMetrics["max_cross_section_mm2"],
+            "diameter_ce_mm": clMetrics["diameter_ce_mm"],
+            "length_mm": clMetrics["length_mm"],
+            "mean_curvature": clMetrics["mean_curvature"],
+            "mean_torsion": clMetrics["mean_torsion"],
+            "tortuosity": clMetrics["tortuosity"],
+            "surface_area_mm2": surfaceArea,
+            "volume_mm3": volume,
+        }
 
         status(_("Done."))
         stopTime = time.time()
