@@ -728,7 +728,9 @@ def run_case_subprocess(seg_path, out_dir, write_vtp, timeout_seconds):
         cmd += ['--write-vtp']
 
     try:
-        proc = subprocess.run(cmd, timeout=timeout_seconds, capture_output=True, text=True)
+        proc = subprocess.run(
+            cmd, timeout=timeout_seconds,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
     except subprocess.TimeoutExpired:
         raise RuntimeError('Timed out after {}s (likely a native VMTK hang)'.format(timeout_seconds))
 
@@ -745,7 +747,8 @@ def run_case_subprocess(seg_path, out_dir, write_vtp, timeout_seconds):
         with open(tmp_json) as f:
             results = json.load(f)
     finally:
-        tmp_json.unlink(missing_ok=True)
+        if tmp_json.exists():
+            tmp_json.unlink()
     return results
 
 
