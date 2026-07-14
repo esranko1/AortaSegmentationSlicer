@@ -534,7 +534,7 @@ class AortaSegmentationLogic(ScriptedLoadableModuleLogic):
 
         curvatureAll = pointArray("Curvature")
         torsionAll = pointArray("Torsion")
-        radiiAll = pointArray("MaximumInscribedSphereRadius")
+        radiiAll = pointArray("Radius")
         length = cellArray("Length")
         tortuosity = cellArray("Tortuosity")
 

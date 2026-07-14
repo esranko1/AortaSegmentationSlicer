@@ -247,7 +247,7 @@ def run(seg_path):
 
     length_array = vtk_np.vtk_to_numpy(result.GetCellData().GetArray('Length'))
     tortuosity_array = vtk_np.vtk_to_numpy(result.GetCellData().GetArray('Tortuosity'))
-    radii = vtk_np.vtk_to_numpy(result.GetPointData().GetArray('MaximumInscribedSphereRadius'))
+    radii = vtk_np.vtk_to_numpy(result.GetPointData().GetArray('Radius'))
     curvature = vtk_np.vtk_to_numpy(result.GetPointData().GetArray('Curvature'))
     torsion = vtk_np.vtk_to_numpy(result.GetPointData().GetArray('Torsion'))
 
