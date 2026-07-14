@@ -823,8 +823,8 @@ def main():
     parser.add_argument('--write-vtp', action='store_true',
                          help='Also write per-case .vtp visualization files in --seg-dir mode (off by default; '
                               'always on in --seg mode)')
-    parser.add_argument('--timeout', type=int, default=600,
-                         help='Per-case timeout in seconds for --seg-dir mode (default: 600). A case that hangs '
+    parser.add_argument('--timeout', type=int, default=180,
+                         help='Per-case timeout in seconds for --seg-dir mode (default: 180). A case that hangs '
                               '(native VMTK hang) or exceeds this is killed and recorded as a failure so the '
                               'batch continues.')
     args = parser.parse_args()
