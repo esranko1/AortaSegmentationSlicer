@@ -9,26 +9,15 @@ so this script runs out-of-process against a separate conda environment that has
 `vmtk` installed, the same way run_inference.py runs nnU-Net out-of-process.
 
 Usage:
-    Single case:
-        python extracting_metrics.py --seg <segmentation.nii.gz> --out-json <results.json> [--out-dir <dir>]
-        Writes the computed metrics to --out-json and, alongside them, four .vtp files
-        (surface, centerline, vessel-tree endpoints, chosen source/target points) into
-        --out-dir (defaults to --seg's own directory) for visual inspection.
+    python extracting_metrics.py --seg <segmentation.nii.gz> --out-json <results.json> [--out-dir <dir>]
 
-    Batch (e.g. a whole labelsTr folder):
-        python extracting_metrics.py --seg-dir <folder> --out-csv <results.csv> [--write-vtp]
-        Processes every .nii.gz in the folder and writes one row per case to
-        --out-csv. Per-case failures are caught and recorded (with the error message)
-        rather than stopping the batch. The CSV is rewritten after every case, so
-        rerunning the same command resumes rather than reprocessing already-completed
-        cases. .vtp visualization files are skipped by default in batch mode (pass
-        --write-vtp to also generate them for every case).
+Writes the computed metrics to --out-json and, alongside them, four .vtp files
+(surface, centerline, vessel-tree endpoints, chosen source/target points) into
+--out-dir (defaults to --seg's own directory) for visual inspection.
 """
 
 import argparse
-import csv
 import json
-import subprocess
 import sys
 from pathlib import Path
 
@@ -287,30 +276,21 @@ def extract_network(surface):
     return network_extraction.GetOutput()
 
 
-def build_network_graph(network_poly_data):
+def get_network_end_points(network_poly_data):
     """
-    Clean the raw network extraction output and build cells/links so it's
-    ready for topology queries (endpoint detection, graph traversal).
+    Return every endpoint of the vessel tree (points belonging to exactly one
+    cell, i.e. degree-1 points of the centerline graph) — this covers branch
+    tips too. The point with the largest MIS radius (the widest opening,
+    typically the aortic root) is returned first.
     """
     vtk, _ = _require_vtk()
+
     cleaner = vtk.vtkCleanPolyData()
     cleaner.SetInputData(network_poly_data)
     cleaner.Update()
     network = cleaner.GetOutput()
     network.BuildCells()
     network.BuildLinks(0)
-    return network
-
-
-def get_network_end_points(network):
-    """
-    Return every endpoint of the vessel tree as (point_id, coords) pairs --
-    points belonging to exactly one cell, i.e. degree-1 points of the
-    centerline graph. Covers branch tips too. The point with the largest MIS
-    radius (the widest opening, typically the aortic root) is returned
-    first. `network` must already be built via build_network_graph.
-    """
-    vtk, _ = _require_vtk()
 
     points = network.GetPoints()
     radius_array = network.GetPointData().GetArray('Radius')
@@ -339,78 +319,28 @@ def get_network_end_points(network):
     n_endpoints = endpoint_ids.GetNumberOfIds()
     if n_endpoints == 0:
         return endpoints
-    endpoints.append((start_point_id, points.GetPoint(start_point_id)))
+    endpoints.append(points.GetPoint(start_point_id))
     for i in range(n_endpoints):
         point_id = endpoint_ids.GetId(i)
         if point_id == start_point_id:
             continue
-        endpoints.append((point_id, points.GetPoint(point_id)))
+        endpoints.append(points.GetPoint(point_id))
     return endpoints
 
 
-def _network_cell_length(network, cell_index):
-    cell = network.GetCell(cell_index)
-    n_pts = cell.GetNumberOfPoints()
-    total = 0.0
-    prev = None
-    for i in range(n_pts):
-        p = np.array(network.GetPoint(cell.GetPointId(i)))
-        if prev is not None:
-            total += float(np.linalg.norm(p - prev))
-        prev = p
-    return total
-
-
-def select_aorta_end_points(network, endpoints):
+def select_aorta_end_points(endpoints):
     """
-    Pick the true two aorta ends by cumulative PATH length along the
-    vessel-tree graph, not straight-line distance. endpoints[0] is the
-    largest-MIS-radius endpoint (get_network_end_points puts it first) --
-    typically the aortic root, the widest opening. The other true aorta end
-    is whichever endpoint requires the LONGEST path to reach from the root
-    by walking the network's actual branch segments -- not whichever is
-    geometrically farthest in 3D. Straight-line "farthest point" is
-    unreliable here: the aortic arch's U-turn can put a branch stub or a
-    point on the arch itself closer to the root in 3D space than the true
-    (possibly short, if the segmentation is cropped) distal end, silently
-    shrinking the chord distance used later and inflating Tortuosity
-    (length / chord) well beyond the real value.
+    endpoints[0] is the largest-MIS-radius endpoint (get_network_end_points
+    puts it first) — typically the aortic root, the widest opening. The
+    other aorta end is whichever endpoint is farthest from it in world
+    space: branch tips (subclavian/carotid/celiac/renal/iliac...) sit much
+    closer to the root than the true distal aortic end does.
     """
-    root_id, root_coords = endpoints[0]
-    if len(endpoints) == 2:
-        return root_coords, endpoints[1][1]
-
-    # Undirected weighted graph: nodes are cell endpoints (branch points and
-    # tree endpoints), edges are network cells weighted by arc length.
-    adjacency = {}
-    for cell_index in range(network.GetNumberOfCells()):
-        cell = network.GetCell(cell_index)
-        n_pts = cell.GetNumberOfPoints()
-        if n_pts < 2:
-            continue
-        a = cell.GetPointId(0)
-        b = cell.GetPointId(n_pts - 1)
-        length = _network_cell_length(network, cell_index)
-        adjacency.setdefault(a, []).append((b, length))
-        adjacency.setdefault(b, []).append((a, length))
-
-    # The network is a tree (no loops), so a plain traversal accumulating
-    # path length from the root is enough -- no need for real Dijkstra.
-    distances = {root_id: 0.0}
-    stack = [root_id]
-    while stack:
-        node = stack.pop()
-        for neighbor, length in adjacency.get(node, []):
-            new_dist = distances[node] + length
-            if neighbor not in distances or new_dist > distances[neighbor]:
-                distances[neighbor] = new_dist
-                stack.append(neighbor)
-
-    print('DEBUG: path length from root to each endpoint: {}'.format(
-        [(pid, distances.get(pid)) for pid, _ in endpoints[1:]]), flush=True)
-
-    target_id, target_coords = max(endpoints[1:], key=lambda e: distances.get(e[0], -1.0))
-    return root_coords, target_coords
+    pts = np.asarray(endpoints)
+    p0 = pts[0]
+    distances = np.linalg.norm(pts[1:] - p0, axis=1)
+    p1 = pts[1 + int(np.argmax(distances))]
+    return tuple(p0), tuple(p1)
 
 
 def clip_surface_at_points(surface, points, radius):
@@ -499,16 +429,15 @@ def get_centerline(surface):
     vmtkscripts = _require_vmtk()
     vtkvmtkComputationalGeometry, _ = _require_vtkvmtk()
 
-    network = build_network_graph(extract_network(surface))
+    network = extract_network(surface)
     endpoints = get_network_end_points(network)
     if len(endpoints) < 2:
         raise RuntimeError(
             'Network extraction found fewer than two endpoints (n={}).'.format(len(endpoints)))
-    print('DEBUG: {} vessel-tree endpoints found (topology-based): {}'.format(
-        len(endpoints), [coords for _, coords in endpoints]), flush=True)
+    print('DEBUG: {} vessel-tree endpoints found (topology-based)'.format(len(endpoints)), flush=True)
 
-    p0, p1 = select_aorta_end_points(network, endpoints)
-    print('DEBUG: aorta ends selected (path-length based): p0={} p1={}'.format(p0, p1), flush=True)
+    p0, p1 = select_aorta_end_points(endpoints)
+    print('DEBUG: aorta ends selected: p0={} p1={}'.format(p0, p1), flush=True)
 
     cl_surface, centroids = open_and_cap(vtkvmtkComputationalGeometry, surface, [p0, p1])
 
@@ -533,8 +462,7 @@ def get_centerline(surface):
     print('DEBUG: centerline computed: {} points, {} cells'.format(
         centerlines.GetNumberOfPoints(), centerlines.GetNumberOfCells()), flush=True)
 
-    endpoint_coords = [coords for _, coords in endpoints]
-    return centerlines, endpoint_coords, source_point, target_point
+    return centerlines, endpoints, source_point, target_point
 
 
 def get_centerline_geometry(centerline):
@@ -624,24 +552,20 @@ def make_point_markers(points_list, radius=2.0):
 # Main
 # ---------------------------------------------------------------------------
 
-METRIC_FIELDNAMES = [
-    'case_id',
-    'diameter_mis_mm', 'cross_sectional_area_mm2', 'diameter_ce_mm', 'length_mm',
-    'mean_curvature', 'mean_torsion', 'tortuosity', 'surface_area_mm2', 'volume_mm3',
-    'error',
-]
-VTP_FIELDNAMES = ['surface_vtp', 'centerline_vtp', 'endpoints_vtp', 'sourcetarget_vtp']
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--seg', type=Path, required=True, help='Segmentation .nii.gz file')
+    parser.add_argument('--out-json', type=Path, required=True, help='Where to write the computed metrics')
+    parser.add_argument('--out-dir', type=Path, default=None,
+                         help='Where to write surface/centerline/endpoint .vtp files (default: alongside --seg)')
+    args = parser.parse_args()
 
-
-def process_case(seg_path, out_dir=None, write_vtp=True):
-    """Runs the full pipeline for a single segmentation file and returns a metrics dict.
-    Raises on failure -- callers doing batch processing should catch and continue."""
-    out_dir = out_dir if out_dir is not None else seg_path.parent
+    out_dir = args.out_dir if args.out_dir is not None else args.seg.parent
     out_dir.mkdir(parents=True, exist_ok=True)
-    name = seg_path.name
-    stem = name[:-len('.nii.gz')] if name.endswith('.nii.gz') else seg_path.stem
+    name = args.seg.name
+    stem = name[:-len('.nii.gz')] if name.endswith('.nii.gz') else args.seg.stem
 
-    image, arr, spacing, qform = read_nifti(seg_path)
+    image, arr, spacing, qform = read_nifti(args.seg)
     image, arr = keep_largest_component(image, arr)
     surface = get_surface_mesh(image, qform)
     surface = smooth_surface(surface)
@@ -656,8 +580,7 @@ def process_case(seg_path, out_dir=None, write_vtp=True):
     cl_metrics = get_centerline_metrics(centerline)
 
     results = {
-        'case_id':                 stem,
-        'diameter_mis_mm':         diameter_mis,
+        'diameter_mis_mm':        diameter_mis,
         'cross_sectional_area_mm2': cl_metrics['max_cross_section_mm2'],
         'diameter_ce_mm':          cl_metrics['diameter_ce_mm'],
         'length_mm':               cl_metrics['length_mm'],
@@ -666,177 +589,36 @@ def process_case(seg_path, out_dir=None, write_vtp=True):
         'tortuosity':              cl_metrics['tortuosity'],
         'surface_area_mm2':        surface_area,
         'volume_mm3':              volume,
-        'error':                   '',
     }
 
-    if write_vtp:
-        surface_path = output_path(out_dir, stem, '_surface.vtp')
-        centerline_path = output_path(out_dir, stem, '_centerline.vtp')
-        endpoints_path = output_path(out_dir, stem, '_endpoints.vtp')
-        sourcetarget_path = output_path(out_dir, stem, '_sourcetarget.vtp')
+    print('DiameterMIS:        {:.4f}'.format(diameter_mis), flush=True)
+    print('CrossSectionalArea: {:.4f}'.format(cl_metrics['max_cross_section_mm2']), flush=True)
+    print('DiameterCE:         {:.4f}'.format(cl_metrics['diameter_ce_mm']), flush=True)
+    print('Length:             {:.4f}'.format(cl_metrics['length_mm']), flush=True)
+    print('Curvature (mean):   {:.6f}'.format(cl_metrics['mean_curvature']), flush=True)
+    print('Torsion (mean):     {:.6f}'.format(cl_metrics['mean_torsion']), flush=True)
+    print('Tortuosity:         {:.5f}'.format(cl_metrics['tortuosity']), flush=True)
+    print('SurfaceAreamm2:     {:.4f}'.format(surface_area), flush=True)
+    print('Volumemm3:          {:.4f}'.format(volume), flush=True)
 
-        write_polydata(surface, surface_path)
-        write_polydata(centerline, centerline_path)
-        write_polydata(make_point_markers(endpoints), endpoints_path)
-        write_polydata(make_point_markers([p0, p1], radius=3.0), sourcetarget_path)
+    surface_path = output_path(out_dir, stem, '_surface.vtp')
+    centerline_path = output_path(out_dir, stem, '_centerline.vtp')
+    endpoints_path = output_path(out_dir, stem, '_endpoints.vtp')
+    sourcetarget_path = output_path(out_dir, stem, '_sourcetarget.vtp')
 
-        results['surface_vtp'] = str(surface_path)
-        results['centerline_vtp'] = str(centerline_path)
-        results['endpoints_vtp'] = str(endpoints_path)
-        results['sourcetarget_vtp'] = str(sourcetarget_path)
+    write_polydata(surface, surface_path)
+    write_polydata(centerline, centerline_path)
+    write_polydata(make_point_markers(endpoints), endpoints_path)
+    write_polydata(make_point_markers([p0, p1], radius=3.0), sourcetarget_path)
 
-    return results
+    results['surface_vtp'] = str(surface_path)
+    results['centerline_vtp'] = str(centerline_path)
+    results['endpoints_vtp'] = str(endpoints_path)
+    results['sourcetarget_vtp'] = str(sourcetarget_path)
 
-
-def print_results(results):
-    print('DiameterMIS:        {:.4f}'.format(results['diameter_mis_mm']), flush=True)
-    print('CrossSectionalArea: {:.4f}'.format(results['cross_sectional_area_mm2']), flush=True)
-    print('DiameterCE:         {:.4f}'.format(results['diameter_ce_mm']), flush=True)
-    print('Length:             {:.4f}'.format(results['length_mm']), flush=True)
-    print('Curvature (mean):   {:.6f}'.format(results['mean_curvature']), flush=True)
-    print('Torsion (mean):     {:.6f}'.format(results['mean_torsion']), flush=True)
-    print('Tortuosity:         {:.5f}'.format(results['tortuosity']), flush=True)
-    print('SurfaceAreamm2:     {:.4f}'.format(results['surface_area_mm2']), flush=True)
-    print('Volumemm3:          {:.4f}'.format(results['volume_mm3']), flush=True)
-
-
-def run_single_case(seg_path, out_json, out_dir):
-    results = process_case(seg_path, out_dir, write_vtp=True)
-    print_results(results)
-    with open(out_json, 'w') as f:
+    with open(args.out_json, 'w') as f:
         json.dump(results, f, indent=2)
-    print('Wrote metrics to {}'.format(out_json), flush=True)
-
-
-def run_case_subprocess(seg_path, out_dir, write_vtp, timeout_seconds):
-    """
-    Runs process_case() for one segmentation in its own subprocess (via
-    _process_case_worker.py), so a native VMTK hang or crash on this specific case
-    (some cases have unusually complex topology that vtkvmtkPolyDataNetworkExtraction
-    can choke on) only kills this subprocess, caught here as a timeout or non-zero
-    exit code, instead of freezing or taking down the whole batch run.
-    """
-    tmp_json = seg_path.with_name(seg_path.stem.split('.')[0] + '_tmp_result.json')
-    cmd = [
-        sys.executable, str(Path(__file__).parent / '_process_case_worker.py'),
-        '--seg', str(seg_path),
-        '--out-json', str(tmp_json),
-    ]
-    if out_dir is not None:
-        cmd += ['--out-dir', str(out_dir)]
-    if write_vtp:
-        cmd += ['--write-vtp']
-
-    try:
-        proc = subprocess.run(
-            cmd, timeout=timeout_seconds,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-    except subprocess.TimeoutExpired:
-        raise RuntimeError('Timed out after {}s (likely a native VMTK hang)'.format(timeout_seconds))
-
-    if proc.stdout:
-        print(proc.stdout, end='', flush=True)
-
-    if proc.returncode != 0:
-        stderr_lines = [line for line in proc.stderr.strip().splitlines() if line.strip()]
-        tail = stderr_lines[-1] if stderr_lines else 'unknown error'
-        raise RuntimeError('Subprocess exited with code {} (likely a native crash): {}'.format(
-            proc.returncode, tail))
-
-    try:
-        with open(tmp_json) as f:
-            results = json.load(f)
-    finally:
-        if tmp_json.exists():
-            tmp_json.unlink()
-    return results
-
-
-def run_batch(seg_dir, out_csv, out_dir, write_vtp=False, timeout_seconds=600):
-    """
-    Processes every .nii.gz in seg_dir and writes one row per case to out_csv.
-    Each case runs in its own subprocess (see run_case_subprocess) with a timeout, so
-    a hang or native crash on one case can't freeze or kill the whole batch. Failures
-    (timeouts, crashes, or ordinary exceptions) are caught and recorded with an error
-    message rather than stopping the run -- across dozens of cases some are expected
-    to fail on edge-case anatomy, and one bad case shouldn't cost the rest.
-    The CSV is rewritten after every case (not just at the end) so an interrupted
-    batch doesn't lose already-completed results; rerunning the same command resumes
-    by skipping case_ids already present in out_csv without an error.
-    """
-    seg_files = sorted(seg_dir.glob('*.nii.gz'))
-    if not seg_files:
-        sys.exit('No .nii.gz files found in {}'.format(seg_dir))
-
-    fieldnames = METRIC_FIELDNAMES + (VTP_FIELDNAMES if write_vtp else [])
-
-    all_results = []
-    completed_ids = set()
-    if out_csv.exists():
-        with open(out_csv, newline='') as f:
-            for row in csv.DictReader(f):
-                all_results.append(row)
-                if not row.get('error'):
-                    completed_ids.add(row['case_id'])
-        print('DEBUG: resuming, {} cases already completed in {}'.format(
-            len(completed_ids), out_csv), flush=True)
-
-    def write_csv():
-        with open(out_csv, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
-            writer.writeheader()
-            writer.writerows(all_results)
-
-    for i, seg_path in enumerate(seg_files, 1):
-        name = seg_path.name
-        stem = name[:-len('.nii.gz')] if name.endswith('.nii.gz') else seg_path.stem
-        if stem in completed_ids:
-            print('=== [{}/{}] {} (already done, skipping) ==='.format(i, len(seg_files), name), flush=True)
-            continue
-
-        print('=== [{}/{}] {} ==='.format(i, len(seg_files), name), flush=True)
-        try:
-            results = run_case_subprocess(seg_path, out_dir, write_vtp, timeout_seconds)
-            print_results(results)
-        except Exception as e:
-            print('ERROR processing {}: {}'.format(name, e), flush=True)
-            results = {'case_id': stem, 'error': str(e)}
-
-        all_results = [r for r in all_results if r.get('case_id') != stem]
-        all_results.append(results)
-        write_csv()
-
-    n_ok = sum(1 for r in all_results if not r.get('error'))
-    print('\n{}/{} cases processed successfully. Results written to {}'.format(
-        n_ok, len(all_results), out_csv), flush=True)
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--seg', type=Path, help='Single segmentation .nii.gz file')
-    group.add_argument('--seg-dir', type=Path, help='Folder of segmentation .nii.gz files to batch process')
-    parser.add_argument('--out-json', type=Path, help='Where to write the computed metrics (--seg mode)')
-    parser.add_argument('--out-csv', type=Path, help='Where to write the metrics table (--seg-dir mode)')
-    parser.add_argument('--out-dir', type=Path, default=None,
-                         help='Where to write surface/centerline/endpoint .vtp files (default: alongside input)')
-    parser.add_argument('--write-vtp', action='store_true',
-                         help='Also write per-case .vtp visualization files in --seg-dir mode (off by default; '
-                              'always on in --seg mode)')
-    parser.add_argument('--timeout', type=int, default=180,
-                         help='Per-case timeout in seconds for --seg-dir mode (default: 180). A case that hangs '
-                              '(native VMTK hang) or exceeds this is killed and recorded as a failure so the '
-                              'batch continues.')
-    args = parser.parse_args()
-
-    if args.seg:
-        if not args.out_json:
-            parser.error('--out-json is required with --seg')
-        run_single_case(args.seg, args.out_json, args.out_dir)
-    else:
-        if not args.out_csv:
-            parser.error('--out-csv is required with --seg-dir')
-        run_batch(args.seg_dir, args.out_csv, args.out_dir, write_vtp=args.write_vtp, timeout_seconds=args.timeout)
+    print('Wrote metrics to {}'.format(args.out_json), flush=True)
 
 
 if __name__ == '__main__':
