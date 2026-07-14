@@ -276,21 +276,30 @@ def extract_network(surface):
     return network_extraction.GetOutput()
 
 
-def get_network_end_points(network_poly_data):
+def build_network_graph(network_poly_data):
     """
-    Return every endpoint of the vessel tree (points belonging to exactly one
-    cell, i.e. degree-1 points of the centerline graph) — this covers branch
-    tips too. The point with the largest MIS radius (the widest opening,
-    typically the aortic root) is returned first.
+    Clean the raw network extraction output and build cells/links so it's
+    ready for topology queries (endpoint detection, graph traversal).
     """
     vtk, _ = _require_vtk()
-
     cleaner = vtk.vtkCleanPolyData()
     cleaner.SetInputData(network_poly_data)
     cleaner.Update()
     network = cleaner.GetOutput()
     network.BuildCells()
     network.BuildLinks(0)
+    return network
+
+
+def get_network_end_points(network):
+    """
+    Return every endpoint of the vessel tree as (point_id, coords) pairs --
+    points belonging to exactly one cell, i.e. degree-1 points of the
+    centerline graph. Covers branch tips too. The point with the largest MIS
+    radius (the widest opening, typically the aortic root) is returned
+    first. `network` must already be built via build_network_graph.
+    """
+    vtk, _ = _require_vtk()
 
     points = network.GetPoints()
     radius_array = network.GetPointData().GetArray('Radius')
@@ -319,28 +328,78 @@ def get_network_end_points(network_poly_data):
     n_endpoints = endpoint_ids.GetNumberOfIds()
     if n_endpoints == 0:
         return endpoints
-    endpoints.append(points.GetPoint(start_point_id))
+    endpoints.append((start_point_id, points.GetPoint(start_point_id)))
     for i in range(n_endpoints):
         point_id = endpoint_ids.GetId(i)
         if point_id == start_point_id:
             continue
-        endpoints.append(points.GetPoint(point_id))
+        endpoints.append((point_id, points.GetPoint(point_id)))
     return endpoints
 
 
-def select_aorta_end_points(endpoints):
+def _network_cell_length(network, cell_index):
+    cell = network.GetCell(cell_index)
+    n_pts = cell.GetNumberOfPoints()
+    total = 0.0
+    prev = None
+    for i in range(n_pts):
+        p = np.array(network.GetPoint(cell.GetPointId(i)))
+        if prev is not None:
+            total += float(np.linalg.norm(p - prev))
+        prev = p
+    return total
+
+
+def select_aorta_end_points(network, endpoints):
     """
-    endpoints[0] is the largest-MIS-radius endpoint (get_network_end_points
-    puts it first) — typically the aortic root, the widest opening. The
-    other aorta end is whichever endpoint is farthest from it in world
-    space: branch tips (subclavian/carotid/celiac/renal/iliac...) sit much
-    closer to the root than the true distal aortic end does.
+    Pick the true two aorta ends by cumulative PATH length along the
+    vessel-tree graph, not straight-line distance. endpoints[0] is the
+    largest-MIS-radius endpoint (get_network_end_points puts it first) --
+    typically the aortic root, the widest opening. The other true aorta end
+    is whichever endpoint requires the LONGEST path to reach from the root
+    by walking the network's actual branch segments -- not whichever is
+    geometrically farthest in 3D. Straight-line "farthest point" is
+    unreliable here: the aortic arch's U-turn can put a branch stub or a
+    point on the arch itself closer to the root in 3D space than the true
+    (possibly short, if the segmentation is cropped) distal end, silently
+    shrinking the chord distance used later and inflating Tortuosity
+    (length / chord) well beyond the real value.
     """
-    pts = np.asarray(endpoints)
-    p0 = pts[0]
-    distances = np.linalg.norm(pts[1:] - p0, axis=1)
-    p1 = pts[1 + int(np.argmax(distances))]
-    return tuple(p0), tuple(p1)
+    root_id, root_coords = endpoints[0]
+    if len(endpoints) == 2:
+        return root_coords, endpoints[1][1]
+
+    # Undirected weighted graph: nodes are cell endpoints (branch points and
+    # tree endpoints), edges are network cells weighted by arc length.
+    adjacency = {}
+    for cell_index in range(network.GetNumberOfCells()):
+        cell = network.GetCell(cell_index)
+        n_pts = cell.GetNumberOfPoints()
+        if n_pts < 2:
+            continue
+        a = cell.GetPointId(0)
+        b = cell.GetPointId(n_pts - 1)
+        length = _network_cell_length(network, cell_index)
+        adjacency.setdefault(a, []).append((b, length))
+        adjacency.setdefault(b, []).append((a, length))
+
+    # The network is a tree (no loops), so a plain traversal accumulating
+    # path length from the root is enough -- no need for real Dijkstra.
+    distances = {root_id: 0.0}
+    stack = [root_id]
+    while stack:
+        node = stack.pop()
+        for neighbor, length in adjacency.get(node, []):
+            new_dist = distances[node] + length
+            if neighbor not in distances or new_dist > distances[neighbor]:
+                distances[neighbor] = new_dist
+                stack.append(neighbor)
+
+    print('DEBUG: path length from root to each endpoint: {}'.format(
+        [(pid, distances.get(pid)) for pid, _ in endpoints[1:]]), flush=True)
+
+    target_id, target_coords = max(endpoints[1:], key=lambda e: distances.get(e[0], -1.0))
+    return root_coords, target_coords
 
 
 def clip_surface_at_points(surface, points, radius):
@@ -429,15 +488,16 @@ def get_centerline(surface):
     vmtkscripts = _require_vmtk()
     vtkvmtkComputationalGeometry, _ = _require_vtkvmtk()
 
-    network = extract_network(surface)
+    network = build_network_graph(extract_network(surface))
     endpoints = get_network_end_points(network)
     if len(endpoints) < 2:
         raise RuntimeError(
             'Network extraction found fewer than two endpoints (n={}).'.format(len(endpoints)))
-    print('DEBUG: {} vessel-tree endpoints found (topology-based)'.format(len(endpoints)), flush=True)
+    print('DEBUG: {} vessel-tree endpoints found (topology-based): {}'.format(
+        len(endpoints), [coords for _, coords in endpoints]), flush=True)
 
-    p0, p1 = select_aorta_end_points(endpoints)
-    print('DEBUG: aorta ends selected: p0={} p1={}'.format(p0, p1), flush=True)
+    p0, p1 = select_aorta_end_points(network, endpoints)
+    print('DEBUG: aorta ends selected (path-length based): p0={} p1={}'.format(p0, p1), flush=True)
 
     cl_surface, centroids = open_and_cap(vtkvmtkComputationalGeometry, surface, [p0, p1])
 
@@ -462,7 +522,8 @@ def get_centerline(surface):
     print('DEBUG: centerline computed: {} points, {} cells'.format(
         centerlines.GetNumberOfPoints(), centerlines.GetNumberOfCells()), flush=True)
 
-    return centerlines, endpoints, source_point, target_point
+    endpoint_coords = [coords for _, coords in endpoints]
+    return centerlines, endpoint_coords, source_point, target_point
 
 
 def get_centerline_geometry(centerline):
