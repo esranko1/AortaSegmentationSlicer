@@ -169,13 +169,16 @@ def select_aorta_end_points(network, endpoints):
     return root_coords, target_coords
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--seg', type=Path, required=True)
-    args = parser.parse_args()
+def run(seg_path):
+    """Callable directly from Slicer's Python console, e.g.:
+    import sys; sys.path.insert(0, r'<this Scripts folder>')
+    import test_vmtk_centerline
+    test_vmtk_centerline.run(r'C:\\path\\to\\segmentation.nii.gz')
+    """
+    seg_path = Path(seg_path)
 
     print('DEBUG: reading NIfTI...', flush=True)
-    image, arr, spacing, qform = read_nifti(args.seg)
+    image, arr, spacing, qform = read_nifti(seg_path)
     image, arr = keep_largest_component(image, arr)
 
     print('DEBUG: marching cubes...', flush=True)
@@ -256,6 +259,13 @@ def main():
     print('CrossSectionalArea: {:.4f}'.format(np.pi * max_radius ** 2))
     print('Curvature (mean):   {:.6f}'.format(float(np.nanmean(curvature))))
     print('Torsion (mean):     {:.6f}'.format(float(np.nanmean(torsion))))
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--seg', type=Path, required=True)
+    args = parser.parse_args()
+    run(args.seg)
 
 
 if __name__ == '__main__':
