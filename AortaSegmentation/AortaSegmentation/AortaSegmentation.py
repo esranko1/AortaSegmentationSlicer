@@ -638,7 +638,7 @@ class AortaSegmentationLogic(ScriptedLoadableModuleLogic):
         self._ensureVmtkExtension()
 
         import ExtractCenterline
-        from vmtk import vtkvmtkComputationalGeometryPython as vtkvmtkComputationalGeometry
+        import vtkvmtkComputationalGeometryPython as vtkvmtkComputationalGeometry
 
         centerlineLogic = ExtractCenterline.ExtractCenterlineLogic()
 
