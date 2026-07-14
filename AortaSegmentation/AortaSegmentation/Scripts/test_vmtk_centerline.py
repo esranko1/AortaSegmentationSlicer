@@ -206,8 +206,8 @@ def run(seg_path):
     print('DEBUG: marching cubes...', flush=True)
     surface = get_surface_mesh(image, qform)
     surface = keep_largest_surface_component(surface)
-    print('DEBUG: surface: {} points, {} cells'.format(
-        surface.GetNumberOfPoints(), surface.GetNumberOfCells()), flush=True)
+    print('DEBUG: surface: {} points, {} cells, bounds={}'.format(
+        surface.GetNumberOfPoints(), surface.GetNumberOfCells(), surface.GetBounds()), flush=True)
 
     centerline_logic = ExtractCenterline.ExtractCenterlineLogic()
 
@@ -215,8 +215,8 @@ def run(seg_path):
     preprocessed = centerline_logic.preprocess(
         surface, targetNumberOfPoints=5000, decimationAggressiveness=4.0, subdivide=False
     )
-    print('DEBUG: preprocessed: {} points, {} cells'.format(
-        preprocessed.GetNumberOfPoints(), preprocessed.GetNumberOfCells()), flush=True)
+    print('DEBUG: preprocessed: {} points, {} cells, bounds={}'.format(
+        preprocessed.GetNumberOfPoints(), preprocessed.GetNumberOfCells(), preprocessed.GetBounds()), flush=True)
 
     print('DEBUG: extractNetwork...', flush=True)
     network_poly_data = centerline_logic.extractNetwork(preprocessed, endPointsMarkupsNode=None)
