@@ -17,6 +17,7 @@ Writes the computed metrics to --out-json and, alongside them, four .vtp files
 """
 
 import argparse
+import heapq
 import json
 import sys
 from pathlib import Path
