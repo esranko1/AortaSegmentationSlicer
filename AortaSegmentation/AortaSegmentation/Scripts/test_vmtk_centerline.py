@@ -134,10 +134,21 @@ def network_cell_length(network, cell_index):
 
 
 def select_aorta_end_points(network, endpoints):
+    """
+    Picks the two true aorta ends as the pair of vessel-tree endpoints with
+    the MAXIMUM path length between them (the tree's "diameter"), rather
+    than assuming the largest-MIS-radius endpoint is always the root.
+    Radius-based root selection can pick the wrong point when mesh
+    decimation happens to leave a slightly-off-center vertex at the true
+    root's dome tip with a misleading reported radius; the globally
+    farthest-apart PAIR by path length is more robust since branch stubs
+    are, by construction, shorter offshoots of the main trunk, not longer
+    than it.
+    """
     import heapq
-    root_id, root_coords = endpoints[0]
+
     if len(endpoints) == 2:
-        return root_coords, endpoints[1][1]
+        return endpoints[0][1], endpoints[1][1]
 
     adjacency = {}
     for cell_index in range(network.GetNumberOfCells()):
@@ -151,22 +162,33 @@ def select_aorta_end_points(network, endpoints):
         adjacency.setdefault(a, []).append((b, length))
         adjacency.setdefault(b, []).append((a, length))
 
-    distances = {root_id: 0.0}
-    visited = set()
-    heap = [(0.0, root_id)]
-    while heap:
-        dist, node = heapq.heappop(heap)
-        if node in visited:
-            continue
-        visited.add(node)
-        for neighbor, length in adjacency.get(node, []):
-            new_dist = dist + length
-            if neighbor not in distances or new_dist < distances[neighbor]:
-                distances[neighbor] = new_dist
-                heapq.heappush(heap, (new_dist, neighbor))
+    def dijkstra_from(source_id):
+        distances = {source_id: 0.0}
+        visited = set()
+        heap = [(0.0, source_id)]
+        while heap:
+            dist, node = heapq.heappop(heap)
+            if node in visited:
+                continue
+            visited.add(node)
+            for neighbor, length in adjacency.get(node, []):
+                new_dist = dist + length
+                if neighbor not in distances or new_dist < distances[neighbor]:
+                    distances[neighbor] = new_dist
+                    heapq.heappush(heap, (new_dist, neighbor))
+        return distances
 
-    target_id, target_coords = max(endpoints[1:], key=lambda e: distances.get(e[0], -1.0))
-    return root_coords, target_coords
+    best_pair = None
+    best_distance = -1.0
+    for i, (id_a, coords_a) in enumerate(endpoints):
+        distances = dijkstra_from(id_a)
+        for id_b, coords_b in endpoints[i + 1:]:
+            d = distances.get(id_b, -1.0)
+            if d > best_distance:
+                best_distance = d
+                best_pair = (coords_a, coords_b)
+
+    return best_pair
 
 
 def run(seg_path):

@@ -474,23 +474,20 @@ class AortaSegmentationLogic(ScriptedLoadableModuleLogic):
 
     def _selectAortaEndPoints(self, network, endpoints):
         """
-        Picks the true two aorta ends by cumulative PATH length along the vessel-tree
-        graph (Dijkstra), not straight-line distance. endpoints[0] is the
-        largest-MIS-radius endpoint (the aortic root, widest opening). The other true
-        aorta end is whichever endpoint requires the longest path to reach from the
-        root by walking the network's actual branch segments - not whichever is
-        geometrically farthest in 3D. Straight-line "farthest point" is unreliable
-        here: the aortic arch's U-turn can put a branch stub or a point on the arch
-        itself closer to the root in 3D space than the true (possibly short, if the
-        segmentation is cropped) distal end, silently shrinking the chord distance
-        used later and inflating Tortuosity (length / chord) well beyond the real
-        value. Dijkstra (not a naive "keep revisiting" walk) is used because the
-        network graph isn't guaranteed to be a perfect tree; a naive longest-path walk
-        can loop forever if it contains even one cycle.
+        Picks the two true aorta ends as the pair of vessel-tree endpoints with the
+        MAXIMUM path length between them (the tree's "diameter"), rather than
+        assuming the largest-MIS-radius endpoint is always the root. Radius-based
+        root selection can pick the wrong point when mesh decimation happens to leave
+        a slightly-off-center vertex at the true root's dome tip with a misleading
+        reported radius - confirmed to shrink the measured Length by more than half
+        on a real case. The globally farthest-apart PAIR by path length is more
+        robust: branch stubs are, by construction, shorter offshoots of the main
+        trunk, not longer than it. Dijkstra (not a naive "keep revisiting" walk) is
+        used because the network graph isn't guaranteed to be a perfect tree; a naive
+        longest-path walk can loop forever if it contains even one cycle.
         """
-        rootId, rootCoords = endpoints[0]
         if len(endpoints) == 2:
-            return rootCoords, endpoints[1][1]
+            return endpoints[0][1], endpoints[1][1]
 
         adjacency = {}
         for cellIndex in range(network.GetNumberOfCells()):
@@ -504,22 +501,33 @@ class AortaSegmentationLogic(ScriptedLoadableModuleLogic):
             adjacency.setdefault(a, []).append((b, length))
             adjacency.setdefault(b, []).append((a, length))
 
-        distances = {rootId: 0.0}
-        visited = set()
-        heap = [(0.0, rootId)]
-        while heap:
-            dist, node = heapq.heappop(heap)
-            if node in visited:
-                continue
-            visited.add(node)
-            for neighbor, length in adjacency.get(node, []):
-                newDist = dist + length
-                if neighbor not in distances or newDist < distances[neighbor]:
-                    distances[neighbor] = newDist
-                    heapq.heappush(heap, (newDist, neighbor))
+        def dijkstraFrom(sourceId):
+            distances = {sourceId: 0.0}
+            visited = set()
+            heap = [(0.0, sourceId)]
+            while heap:
+                dist, node = heapq.heappop(heap)
+                if node in visited:
+                    continue
+                visited.add(node)
+                for neighbor, length in adjacency.get(node, []):
+                    newDist = dist + length
+                    if neighbor not in distances or newDist < distances[neighbor]:
+                        distances[neighbor] = newDist
+                        heapq.heappush(heap, (newDist, neighbor))
+            return distances
 
-        targetId, targetCoords = max(endpoints[1:], key=lambda e: distances.get(e[0], -1.0))
-        return rootCoords, targetCoords
+        bestPair = None
+        bestDistance = -1.0
+        for i, (idA, coordsA) in enumerate(endpoints):
+            distances = dijkstraFrom(idA)
+            for idB, coordsB in endpoints[i + 1:]:
+                d = distances.get(idB, -1.0)
+                if d > bestDistance:
+                    bestDistance = d
+                    bestPair = (coordsA, coordsB)
+
+        return bestPair
 
     def _centerlineMetrics(self, centerline) -> dict:
         import vtk.util.numpy_support as vtk_np
