@@ -690,7 +690,9 @@ class AortaSegmentationLogic(ScriptedLoadableModuleLogic):
         geometry.SetCurvatureArrayName("Curvature")
         geometry.SetTorsionArrayName("Torsion")
         geometry.SetTortuosityArrayName("Tortuosity")
-        geometry.SetLineSmoothing(0)
+        geometry.SetFrenetTangentArrayName("FrenetTangent")
+        geometry.SetFrenetNormalArrayName("FrenetNormal")
+        geometry.SetFrenetBinormalArrayName("FrenetBinormal")
         geometry.Update()
         clMetrics = self._centerlineMetrics(geometry.GetOutput())
 
