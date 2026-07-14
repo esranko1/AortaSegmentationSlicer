@@ -28,8 +28,8 @@ Usage:
 import argparse
 import csv
 import json
+import subprocess
 import sys
-import traceback
 from pathlib import Path
 
 import numpy as np
@@ -708,15 +708,58 @@ def run_single_case(seg_path, out_json, out_dir):
     print('Wrote metrics to {}'.format(out_json), flush=True)
 
 
-def run_batch(seg_dir, out_csv, out_dir, write_vtp=False):
+def run_case_subprocess(seg_path, out_dir, write_vtp, timeout_seconds):
+    """
+    Runs process_case() for one segmentation in its own subprocess (via
+    _process_case_worker.py), so a native VMTK hang or crash on this specific case
+    (some cases have unusually complex topology that vtkvmtkPolyDataNetworkExtraction
+    can choke on) only kills this subprocess, caught here as a timeout or non-zero
+    exit code, instead of freezing or taking down the whole batch run.
+    """
+    tmp_json = seg_path.with_name(seg_path.stem.split('.')[0] + '_tmp_result.json')
+    cmd = [
+        sys.executable, str(Path(__file__).parent / '_process_case_worker.py'),
+        '--seg', str(seg_path),
+        '--out-json', str(tmp_json),
+    ]
+    if out_dir is not None:
+        cmd += ['--out-dir', str(out_dir)]
+    if write_vtp:
+        cmd += ['--write-vtp']
+
+    try:
+        proc = subprocess.run(cmd, timeout=timeout_seconds, capture_output=True, text=True)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError('Timed out after {}s (likely a native VMTK hang)'.format(timeout_seconds))
+
+    if proc.stdout:
+        print(proc.stdout, end='', flush=True)
+
+    if proc.returncode != 0:
+        stderr_lines = [line for line in proc.stderr.strip().splitlines() if line.strip()]
+        tail = stderr_lines[-1] if stderr_lines else 'unknown error'
+        raise RuntimeError('Subprocess exited with code {} (likely a native crash): {}'.format(
+            proc.returncode, tail))
+
+    try:
+        with open(tmp_json) as f:
+            results = json.load(f)
+    finally:
+        tmp_json.unlink(missing_ok=True)
+    return results
+
+
+def run_batch(seg_dir, out_csv, out_dir, write_vtp=False, timeout_seconds=600):
     """
     Processes every .nii.gz in seg_dir and writes one row per case to out_csv.
-    Failures on individual cases are caught and recorded (with the error message)
-    rather than stopping the whole batch -- across dozens of cases some are expected
-    to fail on edge-case anatomy, and one bad case shouldn't cost the rest of the run.
-    The CSV is rewritten after every case (not just at the end) so a crash partway
-    through a long batch doesn't lose already-completed results; rerunning the same
-    command resumes by skipping case_ids already present in out_csv without an error.
+    Each case runs in its own subprocess (see run_case_subprocess) with a timeout, so
+    a hang or native crash on one case can't freeze or kill the whole batch. Failures
+    (timeouts, crashes, or ordinary exceptions) are caught and recorded with an error
+    message rather than stopping the run -- across dozens of cases some are expected
+    to fail on edge-case anatomy, and one bad case shouldn't cost the rest.
+    The CSV is rewritten after every case (not just at the end) so an interrupted
+    batch doesn't lose already-completed results; rerunning the same command resumes
+    by skipping case_ids already present in out_csv without an error.
     """
     seg_files = sorted(seg_dir.glob('*.nii.gz'))
     if not seg_files:
@@ -750,12 +793,11 @@ def run_batch(seg_dir, out_csv, out_dir, write_vtp=False):
 
         print('=== [{}/{}] {} ==='.format(i, len(seg_files), name), flush=True)
         try:
-            results = process_case(seg_path, out_dir, write_vtp=write_vtp)
+            results = run_case_subprocess(seg_path, out_dir, write_vtp, timeout_seconds)
             print_results(results)
-        except Exception:
-            error_text = traceback.format_exc()
-            print('ERROR processing {}:\n{}'.format(name, error_text), flush=True)
-            results = {'case_id': stem, 'error': error_text.strip().splitlines()[-1]}
+        except Exception as e:
+            print('ERROR processing {}: {}'.format(name, e), flush=True)
+            results = {'case_id': stem, 'error': str(e)}
 
         all_results = [r for r in all_results if r.get('case_id') != stem]
         all_results.append(results)
@@ -778,6 +820,10 @@ def main():
     parser.add_argument('--write-vtp', action='store_true',
                          help='Also write per-case .vtp visualization files in --seg-dir mode (off by default; '
                               'always on in --seg mode)')
+    parser.add_argument('--timeout', type=int, default=600,
+                         help='Per-case timeout in seconds for --seg-dir mode (default: 600). A case that hangs '
+                              '(native VMTK hang) or exceeds this is killed and recorded as a failure so the '
+                              'batch continues.')
     args = parser.parse_args()
 
     if args.seg:
@@ -787,7 +833,7 @@ def main():
     else:
         if not args.out_csv:
             parser.error('--out-csv is required with --seg-dir')
-        run_batch(args.seg_dir, args.out_csv, args.out_dir, write_vtp=args.write_vtp)
+        run_batch(args.seg_dir, args.out_csv, args.out_dir, write_vtp=args.write_vtp, timeout_seconds=args.timeout)
 
 
 if __name__ == '__main__':
