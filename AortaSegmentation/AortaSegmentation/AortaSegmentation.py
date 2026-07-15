@@ -1,6 +1,7 @@
 import json
 import logging
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -244,7 +245,7 @@ class AortaSegmentationLogic(ScriptedLoadableModuleLogic):
             ):
                 raise RuntimeError(_("Dependency installation was cancelled by the user."))
             self._installTorch()
-            slicer.util.pip_install("nnunetv2")
+            self._pipInstall("nnunetv2")
             import torch
             import nnunetv2  # noqa: F401
 
@@ -255,9 +256,24 @@ class AortaSegmentationLogic(ScriptedLoadableModuleLogic):
         then runs correctly but far slower, with no obvious indication why. Checking for
         `nvidia-smi` and requesting the matching CUDA wheel avoids that trap."""
         if shutil.which("nvidia-smi") is not None:
-            slicer.util.pip_install("torch --index-url https://download.pytorch.org/whl/cu121")
+            self._pipInstall("torch --index-url https://download.pytorch.org/whl/cu121")
         else:
-            slicer.util.pip_install("torch")
+            self._pipInstall("torch")
+
+    def _pipInstall(self, requirement: str) -> None:
+        """Wraps slicer.util.pip_install so a failure shows pip's actual error instead of
+        Slicer's generic 'returned non-zero exit status 1'. Every user who hits an install
+        failure -- wrong Python ABI, no wheel for their platform, an SSL error, a dependency
+        resolver conflict -- needs to see *why* to have any chance of fixing or reporting it;
+        without this, the failure is identical and undiagnosable on every machine it happens on."""
+        try:
+            slicer.util.pip_install(requirement)
+        except subprocess.CalledProcessError as e:
+            detail = (e.stderr or e.output or "").strip()
+            raise RuntimeError(
+                _("Failed to install '{requirement}':\n\n{detail}").format(
+                    requirement=requirement, detail=detail or str(e))
+            ) from e
 
     def _ensureModel(self) -> Path:
         """Downloads and caches the trained nnU-Net model folder, returns its path."""
