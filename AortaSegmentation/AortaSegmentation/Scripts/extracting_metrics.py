@@ -8,28 +8,17 @@ specific VTK build, which a plain pip install into Slicer's Python can't guarant
 so this script runs out-of-process against a separate conda environment that has
 `vmtk` installed, the same way run_inference.py runs nnU-Net out-of-process.
 
-Usage (single file):
+Usage:
     python extracting_metrics.py --seg <segmentation.nii.gz> --out-json <results.json> [--out-dir <dir>]
 
-Usage (batch over a folder):
-    python extracting_metrics.py --seg-dir <folder> --out-xlsx <results.xlsx> [--out-dir <dir>] [--recursive]
-
-Single-file mode writes the computed metrics to --out-json. Batch mode
-iterates every .nii.gz/.nii file in --seg-dir, computes metrics for each
-(a failure on one file is logged and skipped rather than aborting the run),
-and writes one row per file to --out-xlsx.
-
-Either mode also writes, alongside the metrics, four .vtp files (surface,
-centerline, vessel-tree endpoints, chosen source/target points) into
---out-dir for visual inspection -- in batch mode these go into a
-per-file subfolder named after the segmentation's stem so files from
-different inputs don't collide.
+Writes the computed metrics to --out-json and, alongside them, four .vtp files
+(surface, centerline, vessel-tree endpoints, chosen source/target points) into
+--out-dir (defaults to --seg's own directory) for visual inspection.
 """
 
 import argparse
 import json
 import sys
-import traceback
 from pathlib import Path
 
 import numpy as np
@@ -60,14 +49,6 @@ def _require_vtkvmtk():
         return vtkvmtkComputationalGeometry, vtkvmtkMisc
     except ImportError:
         sys.exit("vtkvmtk python bindings not found. Install with: conda install -c vmtk vmtk")
-
-
-def _require_openpyxl():
-    try:
-        import openpyxl
-        return openpyxl
-    except ImportError:
-        sys.exit("openpyxl not found. Install with: pip install openpyxl")
 
 
 # ---------------------------------------------------------------------------
@@ -295,21 +276,30 @@ def extract_network(surface):
     return network_extraction.GetOutput()
 
 
-def get_network_end_points(network_poly_data):
+def build_network_graph(network_poly_data):
     """
-    Return every endpoint of the vessel tree (points belonging to exactly one
-    cell, i.e. degree-1 points of the centerline graph) — this covers branch
-    tips too. The point with the largest MIS radius (the widest opening,
-    typically the aortic root) is returned first.
+    Clean the raw network extraction output and build cells/links so it's
+    ready for topology queries (endpoint detection, graph traversal).
     """
     vtk, _ = _require_vtk()
-
     cleaner = vtk.vtkCleanPolyData()
     cleaner.SetInputData(network_poly_data)
     cleaner.Update()
     network = cleaner.GetOutput()
     network.BuildCells()
     network.BuildLinks(0)
+    return network
+
+
+def get_network_end_points(network):
+    """
+    Return every endpoint of the vessel tree as (point_id, coords) pairs --
+    points belonging to exactly one cell, i.e. degree-1 points of the
+    centerline graph. Covers branch tips too. The point with the largest MIS
+    radius (the widest opening, typically the aortic root) is returned
+    first. `network` must already be built via build_network_graph.
+    """
+    vtk, _ = _require_vtk()
 
     points = network.GetPoints()
     radius_array = network.GetPointData().GetArray('Radius')
@@ -338,28 +328,78 @@ def get_network_end_points(network_poly_data):
     n_endpoints = endpoint_ids.GetNumberOfIds()
     if n_endpoints == 0:
         return endpoints
-    endpoints.append(points.GetPoint(start_point_id))
+    endpoints.append((start_point_id, points.GetPoint(start_point_id)))
     for i in range(n_endpoints):
         point_id = endpoint_ids.GetId(i)
         if point_id == start_point_id:
             continue
-        endpoints.append(points.GetPoint(point_id))
+        endpoints.append((point_id, points.GetPoint(point_id)))
     return endpoints
 
 
-def select_aorta_end_points(endpoints):
+def _network_cell_length(network, cell_index):
+    cell = network.GetCell(cell_index)
+    n_pts = cell.GetNumberOfPoints()
+    total = 0.0
+    prev = None
+    for i in range(n_pts):
+        p = np.array(network.GetPoint(cell.GetPointId(i)))
+        if prev is not None:
+            total += float(np.linalg.norm(p - prev))
+        prev = p
+    return total
+
+
+def select_aorta_end_points(network, endpoints):
     """
-    endpoints[0] is the largest-MIS-radius endpoint (get_network_end_points
-    puts it first) — typically the aortic root, the widest opening. The
-    other aorta end is whichever endpoint is farthest from it in world
-    space: branch tips (subclavian/carotid/celiac/renal/iliac...) sit much
-    closer to the root than the true distal aortic end does.
+    Pick the true two aorta ends by cumulative PATH length along the
+    vessel-tree graph, not straight-line distance. endpoints[0] is the
+    largest-MIS-radius endpoint (get_network_end_points puts it first) --
+    typically the aortic root, the widest opening. The other true aorta end
+    is whichever endpoint requires the LONGEST path to reach from the root
+    by walking the network's actual branch segments -- not whichever is
+    geometrically farthest in 3D. Straight-line "farthest point" is
+    unreliable here: the aortic arch's U-turn can put a branch stub or a
+    point on the arch itself closer to the root in 3D space than the true
+    (possibly short, if the segmentation is cropped) distal end, silently
+    shrinking the chord distance used later and inflating Tortuosity
+    (length / chord) well beyond the real value.
     """
-    pts = np.asarray(endpoints)
-    p0 = pts[0]
-    distances = np.linalg.norm(pts[1:] - p0, axis=1)
-    p1 = pts[1 + int(np.argmax(distances))]
-    return tuple(p0), tuple(p1)
+    root_id, root_coords = endpoints[0]
+    if len(endpoints) == 2:
+        return root_coords, endpoints[1][1]
+
+    # Undirected weighted graph: nodes are cell endpoints (branch points and
+    # tree endpoints), edges are network cells weighted by arc length.
+    adjacency = {}
+    for cell_index in range(network.GetNumberOfCells()):
+        cell = network.GetCell(cell_index)
+        n_pts = cell.GetNumberOfPoints()
+        if n_pts < 2:
+            continue
+        a = cell.GetPointId(0)
+        b = cell.GetPointId(n_pts - 1)
+        length = _network_cell_length(network, cell_index)
+        adjacency.setdefault(a, []).append((b, length))
+        adjacency.setdefault(b, []).append((a, length))
+
+    # The network is a tree (no loops), so a plain traversal accumulating
+    # path length from the root is enough -- no need for real Dijkstra.
+    distances = {root_id: 0.0}
+    stack = [root_id]
+    while stack:
+        node = stack.pop()
+        for neighbor, length in adjacency.get(node, []):
+            new_dist = distances[node] + length
+            if neighbor not in distances or new_dist > distances[neighbor]:
+                distances[neighbor] = new_dist
+                stack.append(neighbor)
+
+    print('DEBUG: path length from root to each endpoint: {}'.format(
+        [(pid, distances.get(pid)) for pid, _ in endpoints[1:]]), flush=True)
+
+    target_id, target_coords = max(endpoints[1:], key=lambda e: distances.get(e[0], -1.0))
+    return root_coords, target_coords
 
 
 def clip_surface_at_points(surface, points, radius):
@@ -448,15 +488,16 @@ def get_centerline(surface):
     vmtkscripts = _require_vmtk()
     vtkvmtkComputationalGeometry, _ = _require_vtkvmtk()
 
-    network = extract_network(surface)
+    network = build_network_graph(extract_network(surface))
     endpoints = get_network_end_points(network)
     if len(endpoints) < 2:
         raise RuntimeError(
             'Network extraction found fewer than two endpoints (n={}).'.format(len(endpoints)))
-    print('DEBUG: {} vessel-tree endpoints found (topology-based)'.format(len(endpoints)), flush=True)
+    print('DEBUG: {} vessel-tree endpoints found (topology-based): {}'.format(
+        len(endpoints), [coords for _, coords in endpoints]), flush=True)
 
-    p0, p1 = select_aorta_end_points(endpoints)
-    print('DEBUG: aorta ends selected: p0={} p1={}'.format(p0, p1), flush=True)
+    p0, p1 = select_aorta_end_points(network, endpoints)
+    print('DEBUG: aorta ends selected (path-length based): p0={} p1={}'.format(p0, p1), flush=True)
 
     cl_surface, centroids = open_and_cap(vtkvmtkComputationalGeometry, surface, [p0, p1])
 
@@ -481,7 +522,8 @@ def get_centerline(surface):
     print('DEBUG: centerline computed: {} points, {} cells'.format(
         centerlines.GetNumberOfPoints(), centerlines.GetNumberOfCells()), flush=True)
 
-    return centerlines, endpoints, source_point, target_point
+    endpoint_coords = [coords for _, coords in endpoints]
+    return centerlines, endpoint_coords, source_point, target_point
 
 
 def get_centerline_geometry(centerline):
@@ -567,52 +609,24 @@ def make_point_markers(points_list, radius=2.0):
     return append.GetOutput()
 
 
-def find_segmentation_files(seg_dir, recursive=False):
-    patterns = ['**/*.nii.gz', '**/*.nii'] if recursive else ['*.nii.gz', '*.nii']
-    files = set()
-    for pattern in patterns:
-        files.update(seg_dir.glob(pattern))
-    return sorted(files)
-
-
 # ---------------------------------------------------------------------------
-# Excel export (batch mode)
+# Main
 # ---------------------------------------------------------------------------
 
-EXCEL_COLUMNS = [
-    'file', 'status',
-    'diameter_mis_mm', 'cross_sectional_area_mm2', 'diameter_ce_mm', 'length_mm',
-    'mean_curvature', 'mean_torsion', 'tortuosity', 'surface_area_mm2', 'volume_mm3',
-    'surface_vtp', 'centerline_vtp', 'endpoints_vtp', 'sourcetarget_vtp', 'error',
-]
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--seg', type=Path, required=True, help='Segmentation .nii.gz file')
+    parser.add_argument('--out-json', type=Path, required=True, help='Where to write the computed metrics')
+    parser.add_argument('--out-dir', type=Path, default=None,
+                         help='Where to write surface/centerline/endpoint .vtp files (default: alongside --seg)')
+    args = parser.parse_args()
 
-
-def write_results_excel(rows, xlsx_path):
-    openpyxl = _require_openpyxl()
-
-    workbook = openpyxl.Workbook()
-    sheet = workbook.active
-    sheet.title = 'metrics'
-    sheet.append(EXCEL_COLUMNS)
-    for row in rows:
-        sheet.append([row.get(col, '') for col in EXCEL_COLUMNS])
-    sheet.freeze_panes = 'A2'
-
-    xlsx_path.parent.mkdir(parents=True, exist_ok=True)
-    workbook.save(str(xlsx_path))
-
-
-# ---------------------------------------------------------------------------
-# Per-segmentation pipeline
-# ---------------------------------------------------------------------------
-
-def process_segmentation(seg_path, out_dir):
-    """Run the full metrics pipeline on one segmentation file. Returns the results dict."""
+    out_dir = args.out_dir if args.out_dir is not None else args.seg.parent
     out_dir.mkdir(parents=True, exist_ok=True)
-    name = seg_path.name
-    stem = name[:-len('.nii.gz')] if name.endswith('.nii.gz') else seg_path.stem
+    name = args.seg.name
+    stem = name[:-len('.nii.gz')] if name.endswith('.nii.gz') else args.seg.stem
 
-    image, arr, spacing, qform = read_nifti(seg_path)
+    image, arr, spacing, qform = read_nifti(args.seg)
     image, arr = keep_largest_component(image, arr)
     surface = get_surface_mesh(image, qform)
     surface = smooth_surface(surface)
@@ -663,77 +677,9 @@ def process_segmentation(seg_path, out_dir):
     results['endpoints_vtp'] = str(endpoints_path)
     results['sourcetarget_vtp'] = str(sourcetarget_path)
 
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-def main():
-    parser = argparse.ArgumentParser()
-    seg_group = parser.add_mutually_exclusive_group(required=True)
-    seg_group.add_argument('--seg', type=Path, help='Single segmentation .nii.gz file')
-    seg_group.add_argument('--seg-dir', type=Path, help='Folder of segmentation .nii.gz/.nii files to batch-process')
-    parser.add_argument('--out-json', type=Path, default=None,
-                         help='Where to write the computed metrics (single-file mode only)')
-    parser.add_argument('--out-xlsx', type=Path, default=None,
-                         help='Where to write the aggregated metrics spreadsheet (batch mode only)')
-    parser.add_argument('--out-dir', type=Path, default=None,
-                         help="Where to write surface/centerline/endpoint .vtp files (default: alongside --seg, "
-                              "or a per-file subfolder under --seg-dir in batch mode)")
-    parser.add_argument('--recursive', action='store_true',
-                         help='In batch mode, search --seg-dir recursively for segmentation files')
-    args = parser.parse_args()
-
-    if args.seg is not None:
-        if args.out_json is None:
-            parser.error('--out-json is required when using --seg')
-        out_dir = args.out_dir if args.out_dir is not None else args.seg.parent
-        results = process_segmentation(args.seg, out_dir)
-        with open(args.out_json, 'w') as f:
-            json.dump(results, f, indent=2)
-        print('Wrote metrics to {}'.format(args.out_json), flush=True)
-        return
-
-    # Batch mode
-    if args.out_xlsx is None:
-        parser.error('--out-xlsx is required when using --seg-dir')
-
-    seg_files = find_segmentation_files(args.seg_dir, recursive=args.recursive)
-    if not seg_files:
-        sys.exit('No .nii.gz/.nii files found in {}'.format(args.seg_dir))
-    print('Found {} segmentation file(s) in {}'.format(len(seg_files), args.seg_dir), flush=True)
-
-    base_out_dir = args.out_dir if args.out_dir is not None else args.seg_dir
-
-    rows = []
-    for i, seg_path in enumerate(seg_files, 1):
-        print('\n[{}/{}] Processing {}...'.format(i, len(seg_files), seg_path.name), flush=True)
-        name = seg_path.name
-        stem = name[:-len('.nii.gz')] if name.endswith('.nii.gz') else seg_path.stem
-        file_out_dir = base_out_dir / stem
-        try:
-            results = process_segmentation(seg_path, file_out_dir)
-            results['file'] = str(seg_path.relative_to(args.seg_dir))
-            results['status'] = 'ok'
-        except Exception as e:
-            print('ERROR processing {}: {}'.format(seg_path.name, e), flush=True)
-            print(traceback.format_exc(), flush=True)
-            results = {
-                'file': str(seg_path.relative_to(args.seg_dir)),
-                'status': 'error',
-                'error': str(e),
-            }
-        rows.append(results)
-
-        with open(file_out_dir / (stem + '_metrics.json'), 'w') as f:
-            json.dump(results, f, indent=2)
-
-    write_results_excel(rows, args.out_xlsx)
-    n_ok = sum(1 for r in rows if r['status'] == 'ok')
-    print('\nProcessed {}/{} files successfully. Wrote results to {}'.format(
-        n_ok, len(rows), args.out_xlsx), flush=True)
+    with open(args.out_json, 'w') as f:
+        json.dump(results, f, indent=2)
+    print('Wrote metrics to {}'.format(args.out_json), flush=True)
 
 
 if __name__ == '__main__':
