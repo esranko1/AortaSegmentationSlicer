@@ -8,17 +8,28 @@ specific VTK build, which a plain pip install into Slicer's Python can't guarant
 so this script runs out-of-process against a separate conda environment that has
 `vmtk` installed, the same way run_inference.py runs nnU-Net out-of-process.
 
-Usage:
+Usage (single file):
     python extracting_metrics.py --seg <segmentation.nii.gz> --out-json <results.json> [--out-dir <dir>]
 
-Writes the computed metrics to --out-json and, alongside them, four .vtp files
-(surface, centerline, vessel-tree endpoints, chosen source/target points) into
---out-dir (defaults to --seg's own directory) for visual inspection.
+Usage (batch over a folder):
+    python extracting_metrics.py --seg-dir <folder> --out-xlsx <results.xlsx> [--out-dir <dir>] [--recursive]
+
+Single-file mode writes the computed metrics to --out-json. Batch mode
+iterates every .nii.gz/.nii file in --seg-dir, computes metrics for each
+(a failure on one file is logged and skipped rather than aborting the run),
+and writes one row per file to --out-xlsx.
+
+Either mode also writes, alongside the metrics, four .vtp files (surface,
+centerline, vessel-tree endpoints, chosen source/target points) into
+--out-dir for visual inspection -- in batch mode these go into a
+per-file subfolder named after the segmentation's stem so files from
+different inputs don't collide.
 """
 
 import argparse
 import json
 import sys
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -49,6 +60,14 @@ def _require_vtkvmtk():
         return vtkvmtkComputationalGeometry, vtkvmtkMisc
     except ImportError:
         sys.exit("vtkvmtk python bindings not found. Install with: conda install -c vmtk vmtk")
+
+
+def _require_openpyxl():
+    try:
+        import openpyxl
+        return openpyxl
+    except ImportError:
+        sys.exit("openpyxl not found. Install with: pip install openpyxl")
 
 
 # ---------------------------------------------------------------------------
@@ -548,24 +567,52 @@ def make_point_markers(points_list, radius=2.0):
     return append.GetOutput()
 
 
+def find_segmentation_files(seg_dir, recursive=False):
+    patterns = ['**/*.nii.gz', '**/*.nii'] if recursive else ['*.nii.gz', '*.nii']
+    files = set()
+    for pattern in patterns:
+        files.update(seg_dir.glob(pattern))
+    return sorted(files)
+
+
 # ---------------------------------------------------------------------------
-# Main
+# Excel export (batch mode)
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--seg', type=Path, required=True, help='Segmentation .nii.gz file')
-    parser.add_argument('--out-json', type=Path, required=True, help='Where to write the computed metrics')
-    parser.add_argument('--out-dir', type=Path, default=None,
-                         help='Where to write surface/centerline/endpoint .vtp files (default: alongside --seg)')
-    args = parser.parse_args()
+EXCEL_COLUMNS = [
+    'file', 'status',
+    'diameter_mis_mm', 'cross_sectional_area_mm2', 'diameter_ce_mm', 'length_mm',
+    'mean_curvature', 'mean_torsion', 'tortuosity', 'surface_area_mm2', 'volume_mm3',
+    'surface_vtp', 'centerline_vtp', 'endpoints_vtp', 'sourcetarget_vtp', 'error',
+]
 
-    out_dir = args.out_dir if args.out_dir is not None else args.seg.parent
+
+def write_results_excel(rows, xlsx_path):
+    openpyxl = _require_openpyxl()
+
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = 'metrics'
+    sheet.append(EXCEL_COLUMNS)
+    for row in rows:
+        sheet.append([row.get(col, '') for col in EXCEL_COLUMNS])
+    sheet.freeze_panes = 'A2'
+
+    xlsx_path.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(str(xlsx_path))
+
+
+# ---------------------------------------------------------------------------
+# Per-segmentation pipeline
+# ---------------------------------------------------------------------------
+
+def process_segmentation(seg_path, out_dir):
+    """Run the full metrics pipeline on one segmentation file. Returns the results dict."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    name = args.seg.name
-    stem = name[:-len('.nii.gz')] if name.endswith('.nii.gz') else args.seg.stem
+    name = seg_path.name
+    stem = name[:-len('.nii.gz')] if name.endswith('.nii.gz') else seg_path.stem
 
-    image, arr, spacing, qform = read_nifti(args.seg)
+    image, arr, spacing, qform = read_nifti(seg_path)
     image, arr = keep_largest_component(image, arr)
     surface = get_surface_mesh(image, qform)
     surface = smooth_surface(surface)
@@ -616,9 +663,77 @@ def main():
     results['endpoints_vtp'] = str(endpoints_path)
     results['sourcetarget_vtp'] = str(sourcetarget_path)
 
-    with open(args.out_json, 'w') as f:
-        json.dump(results, f, indent=2)
-    print('Wrote metrics to {}'.format(args.out_json), flush=True)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser()
+    seg_group = parser.add_mutually_exclusive_group(required=True)
+    seg_group.add_argument('--seg', type=Path, help='Single segmentation .nii.gz file')
+    seg_group.add_argument('--seg-dir', type=Path, help='Folder of segmentation .nii.gz/.nii files to batch-process')
+    parser.add_argument('--out-json', type=Path, default=None,
+                         help='Where to write the computed metrics (single-file mode only)')
+    parser.add_argument('--out-xlsx', type=Path, default=None,
+                         help='Where to write the aggregated metrics spreadsheet (batch mode only)')
+    parser.add_argument('--out-dir', type=Path, default=None,
+                         help="Where to write surface/centerline/endpoint .vtp files (default: alongside --seg, "
+                              "or a per-file subfolder under --seg-dir in batch mode)")
+    parser.add_argument('--recursive', action='store_true',
+                         help='In batch mode, search --seg-dir recursively for segmentation files')
+    args = parser.parse_args()
+
+    if args.seg is not None:
+        if args.out_json is None:
+            parser.error('--out-json is required when using --seg')
+        out_dir = args.out_dir if args.out_dir is not None else args.seg.parent
+        results = process_segmentation(args.seg, out_dir)
+        with open(args.out_json, 'w') as f:
+            json.dump(results, f, indent=2)
+        print('Wrote metrics to {}'.format(args.out_json), flush=True)
+        return
+
+    # Batch mode
+    if args.out_xlsx is None:
+        parser.error('--out-xlsx is required when using --seg-dir')
+
+    seg_files = find_segmentation_files(args.seg_dir, recursive=args.recursive)
+    if not seg_files:
+        sys.exit('No .nii.gz/.nii files found in {}'.format(args.seg_dir))
+    print('Found {} segmentation file(s) in {}'.format(len(seg_files), args.seg_dir), flush=True)
+
+    base_out_dir = args.out_dir if args.out_dir is not None else args.seg_dir
+
+    rows = []
+    for i, seg_path in enumerate(seg_files, 1):
+        print('\n[{}/{}] Processing {}...'.format(i, len(seg_files), seg_path.name), flush=True)
+        name = seg_path.name
+        stem = name[:-len('.nii.gz')] if name.endswith('.nii.gz') else seg_path.stem
+        file_out_dir = base_out_dir / stem
+        try:
+            results = process_segmentation(seg_path, file_out_dir)
+            results['file'] = str(seg_path.relative_to(args.seg_dir))
+            results['status'] = 'ok'
+        except Exception as e:
+            print('ERROR processing {}: {}'.format(seg_path.name, e), flush=True)
+            print(traceback.format_exc(), flush=True)
+            results = {
+                'file': str(seg_path.relative_to(args.seg_dir)),
+                'status': 'error',
+                'error': str(e),
+            }
+        rows.append(results)
+
+        with open(file_out_dir / (stem + '_metrics.json'), 'w') as f:
+            json.dump(results, f, indent=2)
+
+    write_results_excel(rows, args.out_xlsx)
+    n_ok = sum(1 for r in rows if r['status'] == 'ok')
+    print('\nProcessed {}/{} files successfully. Wrote results to {}'.format(
+        n_ok, len(rows), args.out_xlsx), flush=True)
 
 
 if __name__ == '__main__':
