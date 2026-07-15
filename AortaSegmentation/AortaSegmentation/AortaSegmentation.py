@@ -43,9 +43,10 @@ class AortaSegmentation(ScriptedLoadableModule):
         self.parent.contributors = ["Eszter Sranko"]
         self.parent.helpText = _("""
 Segments the aorta from a single MRI volume using a pretrained nnU-Net model.
-Select an input volume and an output segmentation, then click Apply.
-On first use the module downloads its Python dependencies (PyTorch, nnU-Net) and
-the trained model weights, which requires an internet connection.
+Requires PyTorch and nnU-Net installed in Slicer's Python environment beforehand
+(see the README). Select an input volume and an output segmentation, then click
+Apply. First use downloads the trained model weights, which requires an internet
+connection.
 """)
         self.parent.acknowledgementText = _("")
 
@@ -229,35 +230,21 @@ class AortaSegmentationLogic(ScriptedLoadableModuleLogic):
         return AortaSegmentationParameterNode(super().getParameterNode())
 
     def _ensureDependencies(self):
-        """Installs PyTorch and nnU-Net into Slicer's Python environment if missing."""
+        """Checks that PyTorch and nnU-Net are importable in Slicer's Python environment.
+        Installing them isn't attempted here -- pip installing into Slicer's embedded
+        Python from inside the app produced opaque, hard-to-diagnose failures. Install
+        them manually first (see the README), then this just passes through."""
         try:
-            import torch
+            import torch  # noqa: F401
             import nnunetv2  # noqa: F401
-        except ImportError:
-            if not slicer.util.confirmOkCancelDisplay(
+        except ImportError as e:
+            raise RuntimeError(
                 _(
-                    "This module requires PyTorch and nnU-Net. They will be downloaded and "
-                    "installed into Slicer's Python environment now (one-time, several hundred MB, "
-                    "requires internet access)."
-                ),
-                _("Install dependencies"),
-            ):
-                raise RuntimeError(_("Dependency installation was cancelled by the user."))
-            self._installTorch()
-            slicer.util.pip_install("nnunetv2")
-            import torch
-            import nnunetv2  # noqa: F401
-
-    def _installTorch(self) -> None:
-        """Installs PyTorch, requesting a CUDA build if an NVIDIA GPU is present.
-        A plain `pip install torch` can silently resolve a CPU-only wheel even on a
-        machine with a capable GPU (observed on a machine with an RTX 3090): inference
-        then runs correctly but far slower, with no obvious indication why. Checking for
-        `nvidia-smi` and requesting the matching CUDA wheel avoids that trap."""
-        if shutil.which("nvidia-smi") is not None:
-            slicer.util.pip_install("torch --index-url https://download.pytorch.org/whl/cu121")
-        else:
-            slicer.util.pip_install("torch")
+                    "This module requires PyTorch and nnU-Net, which aren't installed in Slicer's "
+                    "Python environment. Install them manually first (see the README's dependency "
+                    "installation instructions), then click Apply again."
+                )
+            ) from e
 
     def _ensureModel(self) -> Path:
         """Downloads and caches the trained nnU-Net model folder, returns its path."""
