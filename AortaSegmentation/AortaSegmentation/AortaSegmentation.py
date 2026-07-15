@@ -261,19 +261,29 @@ class AortaSegmentationLogic(ScriptedLoadableModuleLogic):
             self._pipInstall("torch")
 
     def _pipInstall(self, requirement: str) -> None:
-        """Wraps slicer.util.pip_install so a failure shows pip's actual error instead of
-        Slicer's generic 'returned non-zero exit status 1'. Every user who hits an install
-        failure -- wrong Python ABI, no wheel for their platform, an SSL error, a dependency
-        resolver conflict -- needs to see *why* to have any chance of fixing or reporting it;
-        without this, the failure is identical and undiagnosable on every machine it happens on."""
-        try:
-            slicer.util.pip_install(requirement)
-        except subprocess.CalledProcessError as e:
-            detail = (e.stderr or e.output or "").strip()
+        """Installs a pip requirement directly (rather than via slicer.util.pip_install) so a
+        failure's actual output is available for the error dialog. slicer.util.pip_install
+        drains the subprocess's combined stdout/stderr line-by-line while it runs (for live
+        console logging) and then hands the now-exhausted, already-closed stream objects to
+        CalledProcessError -- e.stdout/e.stderr end up being closed file handles, not text, so
+        every install failure looks identical ("returned non-zero exit status 1") regardless of
+        its real cause (missing wheel for this platform, SSL error, resolver conflict, ...)."""
+        import shlex
+
+        pythonSlicerExecutablePath = shutil.which("PythonSlicer")
+        if not pythonSlicerExecutablePath:
+            raise RuntimeError(_("PythonSlicer executable not found"))
+
+        cmd = [pythonSlicerExecutablePath, "-m", "pip", "install", *shlex.split(requirement)]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.stdout:
+            logging.info(proc.stdout)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()
             raise RuntimeError(
                 _("Failed to install '{requirement}':\n\n{detail}").format(
-                    requirement=requirement, detail=detail or str(e))
-            ) from e
+                    requirement=requirement, detail=detail)
+            )
 
     def _ensureModel(self) -> Path:
         """Downloads and caches the trained nnU-Net model folder, returns its path."""
