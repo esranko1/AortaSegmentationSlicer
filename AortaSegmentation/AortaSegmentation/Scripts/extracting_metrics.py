@@ -6,7 +6,8 @@ user-configured VMTK conda environment's python.exe), not imported into Slicer d
 Slicer's embedded Python cannot host VMTK (vtkvmtk's compiled bindings must match a
 specific VTK build, which a plain pip install into Slicer's Python can't guarantee),
 so this script runs out-of-process against a separate conda environment that has
-`vmtk` installed, the same way run_inference.py runs nnU-Net out-of-process.
+`vmtk` insta
+lled, the same way run_inference.py runs nnU-Net out-of-process.
 
 Usage:
     python extracting_metrics.py --seg <segmentation.nii.gz> --out-json <results.json> [--out-dir <dir>]
@@ -625,8 +626,9 @@ def run_case_subprocess(seg_path, out_dir, write_vtp, timeout_seconds):
     """
     Runs process_case() for one segmentation in its own subprocess (via
     _process_case_worker.py), so a native VMTK hang or crash on this specific case
-    only kills this subprocess, caught here as a timeout or non-zero exit code,
-    instead of freezing or taking down the whole batch run.
+    (some cases have unusually complex topology that vtkvmtkPolyDataNetworkExtraction
+    can choke on) only kills this subprocess, caught here as a timeout or non-zero
+    exit code, instead of freezing or taking down the whole batch run.
     """
     tmp_json = seg_path.with_name(seg_path.stem.split('.')[0] + '_tmp_result.json')
     cmd = [
@@ -664,13 +666,14 @@ def run_case_subprocess(seg_path, out_dir, write_vtp, timeout_seconds):
     return results
 
 
-def run_batch(seg_dir, out_csv, out_dir, write_vtp=False, timeout_seconds=180):
+def run_batch(seg_dir, out_csv, out_dir, write_vtp=False, timeout_seconds=600):
     """
     Processes every .nii.gz in seg_dir and writes one row per case to out_csv.
     Each case runs in its own subprocess (see run_case_subprocess) with a timeout, so
     a hang or native crash on one case can't freeze or kill the whole batch. Failures
     (timeouts, crashes, or ordinary exceptions) are caught and recorded with an error
-    message rather than stopping the run.
+    message rather than stopping the run -- across dozens of cases some are expected
+    to fail on edge-case anatomy, and one bad case shouldn't cost the rest.
     The CSV is rewritten after every case (not just at the end) so an interrupted
     batch doesn't lose already-completed results; rerunning the same command resumes
     by skipping case_ids already present in out_csv without an error.
@@ -736,7 +739,8 @@ def main():
                               'always on in --seg mode)')
     parser.add_argument('--timeout', type=int, default=180,
                          help='Per-case timeout in seconds for --seg-dir mode (default: 180). A case that hangs '
-                              'or exceeds this is killed and recorded as a failure so the batch continues.')
+                              '(native VMTK hang) or exceeds this is killed and recorded as a failure so the '
+                              'batch continues.')
     args = parser.parse_args()
 
     if args.seg:
