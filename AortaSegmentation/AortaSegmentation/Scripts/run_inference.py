@@ -50,7 +50,10 @@ def main() -> int:
 
     modelFolder = args.model
     foldDirs = sorted(p.name for p in modelFolder.iterdir() if p.is_dir() and p.name.startswith("fold_"))
-    useFolds = tuple(int(name.split("_")[1]) for name in foldDirs) if foldDirs else (0,)
+    # Fold 0 only, not the full 5-fold ensemble: fold 0 alone already validates at 0.90 Dice
+    # (see the README), and skipping the other 4 folds cuts inference time roughly 5x --
+    # substantial on constrained hardware (e.g. shared/virtualized GPUs with little VRAM).
+    useFolds = (0,)
     checkpointName = (
         "checkpoint_final.pth"
         if (modelFolder / foldDirs[0] / "checkpoint_final.pth").exists()
