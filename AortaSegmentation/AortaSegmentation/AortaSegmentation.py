@@ -278,14 +278,20 @@ class AortaSegmentationLogic(ScriptedLoadableModuleLogic):
         ]
 
         proc = slicer.util.launchConsoleProcess(cmd)
+        outputLines = []
         while True:
             line = proc.stdout.readline()
             if not line:
                 break
+            outputLines.append(line.rstrip())
             status(line.rstrip())
         proc.wait()
         if proc.returncode != 0:
-            raise RuntimeError(_("Inference subprocess failed with exit code {code}").format(code=proc.returncode))
+            tail = "\n".join(outputLines[-25:])
+            raise RuntimeError(
+                _("Inference subprocess failed with exit code {code}:\n\n{tail}").format(
+                    code=proc.returncode, tail=tail)
+            )
 
     def process(
         self,
