@@ -67,7 +67,11 @@ def main() -> int:
         tile_step_size=0.8,
         use_gaussian=True,
         use_mirroring=True,
-        perform_everything_on_device=True,
+        # False keeps the accumulated prediction volume on host RAM instead of GPU VRAM
+        # (individual tile forward-passes still run on the GPU). True crashes with a CUDA
+        # OOM on small/shared GPUs -- confirmed on a 2GB vGPU slice (NVIDIA L4-2Q) where
+        # the full accumulator didn't fit alongside the model and activations.
+        perform_everything_on_device=False,
         device=device,
         verbose=True,
         verbose_preprocessing=False,
