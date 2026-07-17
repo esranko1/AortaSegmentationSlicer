@@ -46,7 +46,14 @@ Requires PyTorch and nnU-Net installed in Slicer's Python environment beforehand
 Apply. First use downloads the trained model weights, which requires an internet
 connection.
 """)
-        self.parent.acknowledgementText = _("")
+        self.parent.acknowledgementText = _("""
+Segmentation is performed by a custom-trained nnU-Net v2 model. nnU-Net is not
+original work of this extension's author; see Isensee et al. (2021), "nnU-Net:
+a self-configuring method for deep learning-based biomedical image
+segmentation," Nature Methods 18(2), 203-211
+(https://doi.org/10.1038/s41592-020-01008-z). The training loss additionally
+uses a clDice topology-preservation term (Shit et al., CVPR 2021).
+""")
 
 
 #

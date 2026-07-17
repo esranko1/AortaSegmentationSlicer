@@ -2,7 +2,7 @@
 
 A [3D Slicer](https://www.slicer.org/) extension that segments the aorta from a single MRI volume using a pretrained nnU-Net v2 model. Select an input volume, click Apply, and get a 3D segmentation back in a few minutes.
 
-<!-- TODO: add a screenshot of the module panel + a segmented volume here. -->
+![Aorta Segmentation module panel and a segmented result](Screenshots/1.png)
 
 Mean validation Dice (fold 0, internal validation set): **0.90**. This is a research tool, not a clinically validated or FDA-cleared product — don't use it for diagnosis.
 
@@ -45,6 +45,18 @@ This extension isn't published in the Slicer Extension Manager yet, so install i
 
 The nnU-Net model behind this extension (custom trainer + a clDice-based topology-aware loss for preserving vessel connectivity) was trained in a separate repo: [Aorta-seg](https://github.com/esranko1/Aorta-seg), which covers data preprocessing, training, and postprocessing/QC.
 
+## Acknowledgments
+
+Segmentation is powered by [nnU-Net v2](https://github.com/MIC-DKFZ/nnUNet), not original work of this extension — please cite:
+
+> Isensee, F., Jaeger, P. F., Kohl, S. A. A., Petersen, J., & Maier-Hein, K. H. (2021). nnU-Net: a self-configuring method for deep learning-based biomedical image segmentation. *Nature Methods*, 18(2), 203-211. https://doi.org/10.1038/s41592-020-01008-z
+
+nnU-Net is licensed under the Apache License 2.0. The custom trainer in [`Resources/nnUNetCustomCode/nnUNetTrainerAorta.py`](AortaSegmentation/AortaSegmentation/Resources/nnUNetCustomCode/nnUNetTrainerAorta.py) subclasses it, and its `do_split()` method is a modified copy of nnU-Net's own — see the notice at the top of that file, [`LICENSE-3RD-PARTY`](LICENSE-3RD-PARTY) (nnU-Net's Apache 2.0 license, verbatim), and [`NOTICE`](NOTICE).
+
+The training loss also uses a clDice topology-preservation term:
+
+> Shit, S., Paetzold, J. C., et al. (2021). clDice: A Novel Topology-Preserving Loss Function for Tubular Structure Segmentation. *CVPR 2021*.
+
 ## Repository structure
 
 ```
@@ -65,4 +77,4 @@ AortaSegmentation/
 
 ## License
 
-Not yet specified.
+[MIT](LICENSE)

@@ -1,3 +1,14 @@
+# Custom nnU-Net trainer for aorta MRI segmentation. Subclasses nnU-Net v2
+# (Isensee et al., 2021, https://doi.org/10.1038/s41592-020-01008-z), Copyright
+# 2019 Division of Medical Image Computing, German Cancer Research Center
+# (DKFZ), licensed under the Apache License 2.0 (full text in this repo's
+# top-level LICENSE-3RD-PARTY; see also NOTICE).
+#
+# MODIFIED FROM THE ORIGINAL: `do_split()` below is a modified copy of
+# nnU-Net's own `nnUNetTrainer.do_split()`, changed to group cross-validation
+# splits by patient id instead of by individual case. Everything else in this
+# file is original.
+
 import re
 
 import torch
