@@ -18,7 +18,7 @@ This extension isn't published in the Slicer Extension Manager yet, so install i
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/esranko1/AortaSegmentationSlicer.git
+   git clone https://github.com/esranko1/SlicerAortaSegmentation.git
    ```
 2. In Slicer, go to **Edit → Application Settings → Modules**.
 3. Under **Additional module paths**, click **Add** and select the `AortaSegmentation` folder inside the cloned repo (the one containing `AortaSegmentation.py`).
